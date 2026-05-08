@@ -1,0 +1,12 @@
+numpy
+scipy
+requests
+aiohttp
+pystac-client
+planetary-computer
+rasterio
+zstandard
+Pillow
+matplotlib
+tifffile
+shapely

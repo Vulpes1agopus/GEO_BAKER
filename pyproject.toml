@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "geo-baker"
+version = "1.0.0"
+description = "Global geodata pipeline: bake DEM + population + land cover into compact binary quadtree tiles"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "fanziyu"},
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "requests",
+    "aiohttp",
+    "pystac-client",
+    "planetary-computer",
+    "rasterio",
+    "zstandard",
+    "Pillow",
+    "matplotlib",
+    "tifffile",
+    "shapely",
+]
+
+[project.scripts]
+geo-baker = "geo_baker_pkg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["geo_baker_pkg*"]

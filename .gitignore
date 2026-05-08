@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Byte-compiled
+*.pyc
+*.pyo
+
+# Runtime data — tiles 入 Git；*.dat 不入库（仅本地）
+*.dat
+cache/
+logs/
+*.log
+data/*.pkl
+data/*.gpk
+data/*.npy
+data/*.tif
+data/*.tiff
+data/*.gz
+data/*.zip
+interop/*.json
+interop/*.hpp
+interop/*.dart
+interop/*.svg
+images/
+airports/*.gz
+airports/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Large binary files
+*.tar
+*.tar.gz
+*.zip
+
+# Temporary
+*.tmp
+*.bak

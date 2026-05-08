@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+Geo-Data Visualizer - Generate map previews and heatmaps / 地理数据可视化 - 生成地图预览与热力图
+
+Inspired by OpenFrontMapGenerator's preview capabilities.
+
+Usage / 用法:
+    python tools/visualize.py elevation --bbox 70 20 140 55 -o china_elev.png
+    python tools/visualize.py population --bbox 70 20 140 55 -o china_pop.png
+    python tools/visualize.py zones --bbox 70 20 140 55 -o china_zones.png
+    python tools/visualize.py overview --pack terrain.dat -o global_overview.png
+    python tools/visualize.py compare --lat 39.9 --lon 116.4 -o beijing_compare.png
+"""
+import os
+import sys
+import struct
+import argparse
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from geo_baker_pkg.core import (
+    TILE_DIR, ZONE_WATER, ZONE_NATURAL, ZONE_FOREST, ZONE_HARSH,
+    ZONE_NAMES, GRADIENT_NAMES, URBAN_NAMES,
+    _GPK_MAGIC, _POP_MAGIC, _GPK_HEADER_SIZE, _GPK_GRID_W, _GPK_GRID_H, _GPK_INDEX_SIZE,
+    decode_node_16, decode_pop_leaf_node, decode_elevation, decode_pop_density,
+    navigate_qtr5, navigate_qtr5_pop,
+)
+from geo_baker_pkg.io import query_elevation, query_population
+
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+
+# ── Color Palettes / 调色板 ────────────────────────────────────────
+
+ELEVATION_CMAP = "terrain"
+POPULATION_CMAP = "magma"
+ZONE_COLORS = ["#1a5276", "#f9e79f", "#27ae60", "#7b241c"]
+ZONE_CMAP = ListedColormap(ZONE_COLORS)
+ZONE_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], ZONE_CMAP.N)
+
+GRADIENT_COLORS = ["#2ecc71", "#f1c40f", "#e67e22", "#e74c3c"]
+GRADIENT_CMAP = ListedColormap(GRADIENT_COLORS)
+GRADIENT_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], GRADIENT_CMAP.N)
+
+URBAN_COLORS = ["#1a1a2e", "#e94560", "#0f3460", "#533483", "#16213e", "#2b2d42", "#8d99ae", "#8d99ae"]
+URBAN_CMAP = ListedColormap(URBAN_COLORS)
+URBAN_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5], URBAN_CMAP.N)
+URBAN_LABELS = ["None", "Residential", "Commercial", "Industrial", "Mixed", "Institutional", "Reserved", "Reserved"]
+
+
+def _sample_grid(bbox, resolution, query_fn):
+    """Sample a grid of values from query function / 从查询函数采样网格"""
+    lat_min, lon_min, lat_max, lon_max = bbox
+    lats = np.linspace(lat_min, lat_max, resolution)
+    lons = np.linspace(lon_min, lon_max, resolution)
+    grid = np.full((resolution, resolution), np.nan, dtype=np.float32)
+
+    for i, lat in enumerate(lats):
+        for j, lon in enumerate(lons):
+            result = query_fn(lat, lon)
+            if result is not None:
+                grid[i, j] = result
+
+    return lats, lons, grid
+
+
+def _sample_elevation_grid(bbox, resolution):
+    """Sample elevation grid / 采样海拔网格"""
+    return _sample_grid(bbox, resolution, lambda lat, lon: (query_elevation(lat, lon) or {}).get('elevation', np.nan))
+
+
+def _sample_population_grid(bbox, resolution):
+    """Sample population grid / 采样人口网格"""
+    return _sample_grid(bbox, resolution, lambda lat, lon: (query_population(lat, lon) or {}).get('pop_density', np.nan))
+
+
+def _sample_zone_grid(bbox, resolution):
+    """Sample zone grid / 采样区域网格"""
+    return _sample_grid(bbox, resolution, lambda lat, lon: (query_elevation(lat, lon) or {}).get('zone', np.nan))
+
+
+def _sample_gradient_grid(bbox, resolution):
+    """Sample gradient grid / 采样坡度网格"""
+    return _sample_grid(bbox, resolution, lambda lat, lon: (query_elevation(lat, lon) or {}).get('gradient_level', np.nan))
+
+
+def cmd_elevation(args):
+    """Render elevation heatmap / 渲染海拔热力图"""
+    bbox = (args.south, args.west, args.north, args.east)
+    lats, lons, grid = _sample_elevation_grid(bbox, args.resolution)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    im = ax.imshow(grid, origin="lower", extent=[args.west, args.east, args.south, args.north],
+                   cmap=ELEVATION_CMAP, interpolation="nearest", aspect="auto")
+    ax.set_xlabel("Longitude / 经度")
+    ax.set_ylabel("Latitude / 纬度")
+    ax.set_title(f"Elevation / 海拔 ({args.west}E-{args.east}E, {args.south}N-{args.north}N)")
+    fig.colorbar(im, ax=ax, label="Elevation (m) / 海拔(米)", shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(args.output, dpi=args.dpi)
+    plt.close(fig)
+    print(f"Saved / 已保存: {args.output}")
+
+
+def cmd_population(args):
+    """Render population density heatmap / 渲染人口密度热力图"""
+    bbox = (args.south, args.west, args.north, args.east)
+    lats, lons, grid = _sample_population_grid(bbox, args.resolution)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    vmax = float(np.nanpercentile(grid, 99)) if np.any(~np.isnan(grid)) else 1.0
+    im = ax.imshow(grid, origin="lower", extent=[args.west, args.east, args.south, args.north],
+                   cmap=POPULATION_CMAP, vmin=0, vmax=max(vmax, 1), interpolation="nearest", aspect="auto")
+    ax.set_xlabel("Longitude / 经度")
+    ax.set_ylabel("Latitude / 纬度")
+    ax.set_title(f"Population Density / 人口密度 ({args.west}E-{args.east}E, {args.south}N-{args.north}N)")
+    fig.colorbar(im, ax=ax, label="Pop density (/km²) / 人口密度", shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(args.output, dpi=args.dpi)
+    plt.close(fig)
+    print(f"Saved / 已保存: {args.output}")
+
+
+def cmd_zones(args):
+    """Render terrain zone map / 渲染地形区域图"""
+    bbox = (args.south, args.west, args.north, args.east)
+    lats, lons, grid = _sample_zone_grid(bbox, args.resolution)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    im = ax.imshow(grid, origin="lower", extent=[args.west, args.east, args.south, args.north],
+                   cmap=ZONE_CMAP, norm=ZONE_NORM, interpolation="nearest", aspect="auto")
+    ax.set_xlabel("Longitude / 经度")
+    ax.set_ylabel("Latitude / 纬度")
+    ax.set_title(f"Terrain Zones / 地形区域 ({args.west}E-{args.east}E, {args.south}N-{args.north}N)")
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8, ticks=[0, 1, 2, 3])
+    cbar.ax.set_yticklabels(["Water / 水体", "Natural / 自然", "Forest / 森林", "Harsh / 严酷"])
+    fig.tight_layout()
+    fig.savefig(args.output, dpi=args.dpi)
+    plt.close(fig)
+    print(f"Saved / 已保存: {args.output}")
+
+
+def cmd_overview(args):
+    """Render global overview from .dat pack / 从.dat包渲染全球概览"""
+    pack_path = Path(args.pack)
+    if not pack_path.exists():
+        print(f"  Pack file not found / 包文件未找到: {pack_path}")
+        return
+
+    samples_per_tile = getattr(args, 'samples_per_tile', 4)
+    h = 180 * samples_per_tile
+    w = 360 * samples_per_tile
+    step = 1.0 / samples_per_tile
+
+    from geo_baker_pkg.io import GeoPackReader
+    with GeoPackReader(pack_path) as reader:
+        grid = np.full((h, w), np.nan, dtype=np.float32)
+        for lat in range(-90, 90):
+            for lon in range(-180, 180):
+                for si in range(samples_per_tile):
+                    for sj in range(samples_per_tile):
+                        q_lat = lat + (si + 0.5) * step
+                        q_lon = lon + (sj + 0.5) * step
+                        node = reader.query_terrain(q_lat, q_lon)
+                        if node and node.get('is_leaf'):
+                            row = (lat + 90) * samples_per_tile + si
+                            col = (lon + 180) * samples_per_tile + sj
+                            grid[row, col] = node.get('elevation', 0)
+
+    fig, ax = plt.subplots(figsize=(36, 18))
+    im = ax.imshow(grid, origin="lower", extent=[-180, 180, -90, 90],
+                   cmap=ELEVATION_CMAP, interpolation="nearest", aspect="auto")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("Global Elevation Overview")
+    fig.colorbar(im, ax=ax, label="Elevation (m)", shrink=0.6)
+    fig.tight_layout()
+    fig.savefig(args.output, dpi=args.dpi)
+    plt.close(fig)
+    print(f"Saved / 已保存: {args.output} ({w}x{h})")
+
+
+def cmd_quad_overview(args):
+    terrain_path = Path(args.terrain_pack)
+    pop_path = Path(args.pop_pack)
+    if not terrain_path.exists():
+        print(f"  Terrain pack not found: {terrain_path}")
+        return
+    if not pop_path.exists():
+        print(f"  Population pack not found: {pop_path}")
+        return
+
+    spt = 8
+    h = 180 * spt
+    w = 360 * spt
+    step = 1.0 / spt
+    total = 180 * 360
+    done = 0
+
+    elev_grid = np.full((h, w), np.nan, dtype=np.float32)
+    zone_grid = np.full((h, w), np.nan, dtype=np.float32)
+    urban_grid = np.full((h, w), np.nan, dtype=np.float32)
+    pop_grid = np.full((h, w), np.nan, dtype=np.float32)
+
+    from geo_baker_pkg.io import GeoPackReader
+    with GeoPackReader(terrain_path) as t_reader, GeoPackReader(pop_path) as p_reader:
+        for lat in range(-90, 90):
+            for lon in range(-180, 180):
+                tile_blob = t_reader._read_tile(lat, lon)
+                is_water_tile = tile_blob is not None and len(tile_blob) <= 1
+                pop_blob = p_reader._read_tile(lat, lon)
+                is_water_pop = pop_blob is not None and len(pop_blob) <= 1
+
+                for si in range(spt):
+                    for sj in range(spt):
+                        row = (lat + 90) * spt + si
+                        col = (lon + 180) * spt + sj
+                        if is_water_tile:
+                            elev_grid[row, col] = 0
+                            zone_grid[row, col] = ZONE_WATER
+                        else:
+                            q_lat = lat + (si + 0.5) * step
+                            q_lon = lon + (sj + 0.5) * step
+                            tn = t_reader.query_terrain(q_lat, q_lon)
+                            if tn and tn.get('is_leaf'):
+                                elev_grid[row, col] = tn.get('elevation', 0)
+                                zone_grid[row, col] = tn.get('zone', 0)
+                        if is_water_pop:
+                            pop_grid[row, col] = 0
+                            urban_grid[row, col] = 0
+                        else:
+                            q_lat = lat + (si + 0.5) * step
+                            q_lon = lon + (sj + 0.5) * step
+                            pn = p_reader.query_population(q_lat, q_lon)
+                            if pn and pn.get('is_leaf'):
+                                pop_grid[row, col] = pn.get('pop_density', 0)
+                                urban_grid[row, col] = pn.get('urban_zone', 0)
+                done += 1
+                if done % 60 == 0 or done == total:
+                    pct = done / total * 100
+                    print(f"  Sampling: {pct:.1f}% ({done}/{total})", end='\r')
+
+    print()
+
+    fig, axes = plt.subplots(2, 2, figsize=(48, 24))
+    extent = [-180, 180, -90, 90]
+
+    im0 = axes[0, 0].imshow(elev_grid, origin="lower", extent=extent,
+                             cmap=ELEVATION_CMAP, interpolation="bilinear", aspect="auto")
+    axes[0, 0].set_title("Global Elevation", fontsize=18)
+    fig.colorbar(im0, ax=axes[0, 0], label="Elevation (m)", shrink=0.6)
+
+    valid_pop = pop_grid[np.isfinite(pop_grid)]
+    vmax = float(np.nanpercentile(valid_pop, 99)) if len(valid_pop) > 0 else 1.0
+    im1 = axes[0, 1].imshow(pop_grid, origin="lower", extent=extent,
+                             cmap=POPULATION_CMAP, vmin=0, vmax=max(vmax, 1),
+                             interpolation="bilinear", aspect="auto")
+    axes[0, 1].set_title("Global Population Density", fontsize=18)
+    fig.colorbar(im1, ax=axes[0, 1], label="Pop density (/km²)", shrink=0.6)
+
+    im2 = axes[1, 0].imshow(zone_grid, origin="lower", extent=extent,
+                             cmap=ZONE_CMAP, norm=ZONE_NORM, interpolation="nearest", aspect="auto")
+    axes[1, 0].set_title("Global Terrain Zones", fontsize=18)
+    cbar2 = fig.colorbar(im2, ax=axes[1, 0], ticks=[0, 1, 2, 3], shrink=0.6)
+    cbar2.ax.set_yticklabels(["Water", "Natural", "Forest", "Harsh"])
+
+    im3 = axes[1, 1].imshow(urban_grid, origin="lower", extent=extent,
+                             cmap=URBAN_CMAP, norm=URBAN_NORM, interpolation="nearest", aspect="auto")
+    axes[1, 1].set_title("Global Urban Zone", fontsize=18)
+    cbar3 = fig.colorbar(im3, ax=axes[1, 1], ticks=list(range(8)), shrink=0.6)
+    cbar3.ax.set_yticklabels(URBAN_LABELS)
+
+    for ax in axes.flat:
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+
+    fig.suptitle("GeoBaker Global Overview", fontsize=22, y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(args.output, dpi=args.dpi)
+    plt.close(fig)
+    print(f"Saved: {args.output} ({w}x{h})")
+
+def cmd_compare(args):
+    """Compare elevation + population at a point / 对比某点的海拔与人口"""
+    lat, lon = args.lat, args.lon
+
+    result = query_elevation(lat, lon)
+    pop_result = query_population(lat, lon)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for ax, data_fn, title, cmap_label in [
+        (axes[0], _sample_elevation_grid, "Elevation / 海拔", "m"),
+        (axes[1], _sample_population_grid, "Population / 人口", "/km²"),
+    ]:
+        bbox = (lat - 0.5, lon - 0.5, lat + 0.5, lon + 0.5)
+        _, _, grid = data_fn(bbox, 100)
+        im = ax.imshow(grid, origin="lower", extent=bbox[:2] + bbox[2:],
+                       cmap=ELEVATION_CMAP if "Elev" in title else POPULATION_CMAP,
+                       interpolation="nearest", aspect="auto")
+        ax.set_title(title)
+        ax.set_xlabel("Longitude / 经度")
+        ax.set_ylabel("Latitude / 纬度")
+        fig.colorbar(im, ax=ax, label=cmap_label, shrink=0.8)
+        ax.plot(lon, lat, "r*", markersize=15)
+
+    fig.suptitle(f"Point Comparison / 点对比: ({lat}N, {lon}E)")
+    fig.tight_layout()
+    fig.savefig(args.output, dpi=args.dpi)
+    plt.close(fig)
+    print(f"Saved / 已保存: {args.output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Geo-Data Visualizer / 地理数据可视化")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_bbox_args(p):
+        p.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("SOUTH", "WEST", "NORTH", "EAST"))
+        p.add_argument("--resolution", type=int, default=200, help="Grid resolution / 网格分辨率")
+        p.add_argument("-o", "--output", type=str, default="output.png", help="Output path / 输出路径")
+        p.add_argument("--dpi", type=int, default=140, help="Output DPI / 输出DPI")
+
+    e = sub.add_parser("elevation", help="Elevation heatmap / 海拔热力图")
+    add_bbox_args(e)
+
+    p = sub.add_parser("population", help="Population heatmap / 人口热力图")
+    add_bbox_args(p)
+
+    z = sub.add_parser("zones", help="Terrain zone map / 地形区域图")
+    add_bbox_args(z)
+
+    o = sub.add_parser("overview", help="Global overview from .dat / 全球概览")
+    o.add_argument("--pack", type=str, default="terrain.dat", help=".dat pack path / 包路径")
+    o.add_argument("-o", "--output", type=str, default="global_overview.png", help="Output path / 输出路径")
+    o.add_argument("--dpi", type=int, default=140, help="Output DPI / 输出DPI")
+
+    q = sub.add_parser("quad-overview", help="Global 4-panel overview / 全球四合一概览")
+    q.add_argument("--terrain-pack", type=str, default="terrain.dat", help="Terrain .dat path")
+    q.add_argument("--pop-pack", type=str, default="population.dat", help="Population .dat path")
+    q.add_argument("-o", "--output", type=str, default="global_quad_overview.png", help="Output path")
+    q.add_argument("--dpi", type=int, default=140, help="Output DPI")
+
+    c = sub.add_parser("compare", help="Compare elevation+pop at point / 对比海拔+人口")
+    c.add_argument("--lat", type=float, required=True, help="Latitude / 纬度")
+    c.add_argument("--lon", type=float, required=True, help="Longitude / 经度")
+    c.add_argument("-o", "--output", type=str, default="compare.png", help="Output path / 输出路径")
+    c.add_argument("--dpi", type=int, default=140, help="Output DPI / 输出DPI")
+
+    args = parser.parse_args()
+
+    if args.command == "elevation":
+        args.south, args.west, args.north, args.east = args.bbox
+        cmd_elevation(args)
+    elif args.command == "population":
+        args.south, args.west, args.north, args.east = args.bbox
+        cmd_population(args)
+    elif args.command == "zones":
+        args.south, args.west, args.north, args.east = args.bbox
+        cmd_zones(args)
+    elif args.command == "overview":
+        cmd_overview(args)
+    elif args.command == "quad-overview":
+        cmd_quad_overview(args)
+    elif args.command == "compare":
+        cmd_compare(args)
+
+
+if __name__ == "__main__":
+    main()

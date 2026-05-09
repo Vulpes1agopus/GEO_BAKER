@@ -1,94 +1,67 @@
 """
-核心定义：常量、编码、四叉树 / Core: constants, encoding, quadtree
+Core: constants, encoding, quadtree
 
-本模块包含整个管线的基础定义，无外部项目依赖。
-This module contains foundational definitions for the entire pipeline, no external project deps.
-
-QTR5 格式: 16bit节点, DFS前序遍历, subtree_size导航
-- 地形叶节点: [1bit is_leaf=1][11bit 海拔(非线性)][2bit 坡度][2bit 区域]
-- 人口叶节点: [1bit is_leaf=1][12bit 人口密度(对数)][3bit 城市类型]
-- 分支节点:   [1bit is_leaf=0][15bit subtree_size]
+QTR5 format: 16bit nodes, DFS pre-order, subtree_size navigation
+- Terrain leaf: [1b is_leaf=1][11b elevation][2b gradient][2b zone]
+- Pop leaf:     [1b is_leaf=1][12b pop_density][3b urban_type]
+- Branch:       [1b is_leaf=0][15b subtree_size]
 """
 
 import math
 import struct
 import os
+from pathlib import Path
 
 import numpy as np
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 常量与配置 / Constants & Configuration
-# ═══════════════════════════════════════════════════════════════════
+# ── Constants ──────────────────────────────────────────────────────
 
 TILE_DIR = os.environ.get("GEO_BAKER_TILE_DIR", "tiles")
 LOG_FILE = os.environ.get("GEO_BAKER_LOG_FILE", "logs/bake.log")
-GLOBAL_GPK = "data/global.gpk"
 
-# ── 地形区域 / Terrain Zone ──────────────────────────────────────
-ZONE_WATER = 0
-ZONE_NATURAL = 1
-ZONE_FOREST = 2
-ZONE_HARSH = 3
-
-ZONE_NAMES = {
-    0: "水体 / Water",
-    1: "自然裸地 / Natural bare",
-    2: "森林 / Forest",
-    3: "严酷地形 / Harsh terrain",
-}
-
+ZONE_WATER, ZONE_NATURAL, ZONE_FOREST, ZONE_HARSH = 0, 1, 2, 3
+ZONE_NAMES = {0: "Water", 1: "Natural", 2: "Forest", 3: "Harsh"}
 ZONE_BUILD_COST = {0: 99.0, 1: 1.0, 2: 1.5, 3: 6.0}
-
 ESA_TO_ZONE = {
-    # 0 is ESA nodata/unknown; do not force it to water.
-    0: ZONE_NATURAL, 10: ZONE_FOREST, 20: ZONE_NATURAL, 30: ZONE_NATURAL,
-    40: ZONE_NATURAL, 50: ZONE_NATURAL, 60: ZONE_NATURAL, 70: ZONE_HARSH,
-    80: ZONE_WATER, 90: ZONE_HARSH, 95: ZONE_HARSH, 100: ZONE_NATURAL,
+    0: 1, 10: 2, 20: 1, 30: 1, 40: 1, 50: 1, 60: 1,
+    70: 3, 80: 0, 90: 3, 95: 3, 100: 1,
 }
 
-# ── 坡度等级 / Gradient ──────────────────────────────────────────
-GRADIENT_FLAT = 0
-GRADIENT_GENTLE = 1
-GRADIENT_STEEP = 2
-GRADIENT_CLIFF = 3
-
-GRADIENT_NAMES = {0: "平坦 / Flat", 1: "缓坡 / Gentle", 2: "陡坡 / Steep", 3: "悬崖 / Cliff"}
+GRADIENT_FLAT, GRADIENT_GENTLE, GRADIENT_STEEP, GRADIENT_CLIFF = 0, 1, 2, 3
+GRADIENT_NAMES = {0: "Flat", 1: "Gentle", 2: "Steep", 3: "Cliff"}
 GRADIENT_THRESHOLDS = [10, 50, 200]
 
-# ── 城市区域 / Urban Zone ────────────────────────────────────────
-URBAN_NONE = 0
-URBAN_RESIDENTIAL = 1
-URBAN_COMMERCIAL = 2
-URBAN_INDUSTRIAL = 3
-URBAN_MIXED = 4
-URBAN_INSTITUTIONAL = 5
-
+URBAN_NONE, URBAN_RESIDENTIAL, URBAN_COMMERCIAL = 0, 1, 2
+URBAN_INDUSTRIAL, URBAN_MIXED, URBAN_INSTITUTIONAL = 3, 4, 5
 URBAN_NAMES = {
-    0: "无人区 / Uninhabited", 1: "住宅区 / Residential", 2: "商业区 / Commercial",
-    3: "工业区 / Industrial", 4: "混合区 / Mixed", 5: "机构区 / Institutional",
-    6: "保留 / Reserved", 7: "保留 / Reserved",
+    0: "Uninhabited", 1: "Residential", 2: "Commercial",
+    3: "Industrial", 4: "Mixed", 5: "Institutional", 6: "Reserved", 7: "Reserved",
 }
-
 URBAN_BUILD_COST = {0: 1.0, 1: 1.2, 2: 3.0, 3: 2.0, 4: 2.5, 5: 2.0, 6: 1.0, 7: 1.0}
 ESA_URBAN_CLASS = 50
 
-# ── 人口编码参数 / Population Encoding Params ────────────────────
 _POP_LOG_SCALE = 355.7
 _POP_LOG_MAX = 4095
 _POP_NOISE_FLOOR = 1.0
 
-# ── 四叉树限制 / Quadtree Limits ────────────────────────────────
-MAX_NODES_TERRAIN = 30000
-MAX_NODES_POP = 30000
-FORCE_DEPTH_TERRAIN = 3
-FORCE_DEPTH_POP = 4
-TARGET_SIZE = 1200
+MAX_NODES = 30000
+# Shallower forced subdivision → fewer nodes before adaptive rules kick in (was 3/4, hit MAX often).
+FORCE_DEPTH_TERRAIN = 2
+FORCE_DEPTH_POP = 3
+TARGET_SIZE = 1024
+# Elevation and zone split gates.  Variance catches broad relief; max error catches
+# narrow ridges/cliffs that get averaged away; zone minority protects flat coastlines.
+_TERRAIN_VAR = 1.0
+_TERRAIN_MAX_ABS_ERROR = 4.0
+_WATER_MIX_VAR = 5.0
+_ZONE_MIX_MINORITY = 0.02
+_COASTAL_POP_PX = 10.0
+_POP_VAR = 16.0
+_POP_HOTSPOT_DELTA = 25.0
+_POP_HOTSPOT_RATIO = 3.0
 
-# ── 数据源URL / Data Source URLs ────────────────────────────────
 STAC_PC = "https://planetarycomputer.microsoft.com/api/stac/v1"
 STAC_E84 = "https://earth-search.aws.element84.com/v1"
-STAC_CDSE = "https://stac.dataspace.copernicus.eu/v1"
 OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
 WORLDPOP_ARCGIS_URL = (
     "https://worldpop.arcgis.com/arcgis/rest/services/"
@@ -98,387 +71,341 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
     "https://z.overpass-api.de/api/interpreter",
-    "https://overpass.openstreetmap.ru/api/interpreter",
 ]
 
-# ── GeoPack 二进制格式 / Binary Pack Format ─────────────────────
 _GPK_MAGIC = b"GPK3"
 _POP_MAGIC = b"GPOP"
 _GPK_HEADER_SIZE = 32
-_GPK_GRID_W = 360
-_GPK_GRID_H = 180
+_GPK_GRID_W, _GPK_GRID_H = 360, 180
 _GPK_INDEX_SIZE = _GPK_GRID_W * _GPK_GRID_H * 16
 MAX_PACK_SIZE_MB = 1024
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 编码 / Encoding
-# ═══════════════════════════════════════════════════════════════════
+# ── Encoding ───────────────────────────────────────────────────────
+# Elevation: 11-bit piecewise-linear
+# 0-511m@1m, 512-1535m@2m, 1536-3583m@4m, 3584-8190m@8m
 
-# 海拔: 11bit分段线性编码 / Elevation: 11-bit piecewise-linear
-# 0-511m @ 1m精度, 512-1535m @ 2m, 1536-3583m @ 4m, 3584-8190m @ 8m
-
-def encode_elevation(meters: float) -> int:
-    meters = max(0, min(8190, int(meters)))
-    if meters <= 511:
-        return meters
-    elif meters <= 1535:
-        return 512 + (meters - 512) // 2
-    elif meters <= 3583:
-        return 1024 + (meters - 1536) // 4
-    else:
-        return 1536 + min(511, (meters - 3584) // 8)
+def encode_elevation(meters):
+    m = max(0, min(8190, int(meters)))
+    if m <= 511: return m
+    if m <= 1535: return 512 + (m - 512) // 2
+    if m <= 3583: return 1024 + (m - 1536) // 4
+    return 1536 + min(511, (m - 3584) // 8)
 
 
-def decode_elevation(stored: int) -> int:
-    stored = max(0, min(2047, int(stored)))
-    if stored <= 511:
-        return stored
-    elif stored <= 1023:
-        return 512 + (stored - 512) * 2
-    elif stored <= 1535:
-        return 1536 + (stored - 1024) * 4
-    else:
-        return 3584 + (stored - 1536) * 8
+def decode_elevation(s):
+    s = max(0, min(2047, int(s)))
+    if s <= 511: return s
+    if s <= 1023: return 512 + (s - 512) * 2
+    if s <= 1535: return 1536 + (s - 1024) * 4
+    return 3584 + (s - 1536) * 8
 
 
-# 人口: 12bit对数编码 / Population: 12-bit logarithmic
-
-def encode_pop_density(density: float) -> int:
-    if density <= 0:
-        return 0
-    encoded = int(math.log1p(density) * _POP_LOG_SCALE)
-    return max(1, min(_POP_LOG_MAX, encoded))
+def encode_pop_density(d):
+    return 0 if d <= 0 else max(1, min(_POP_LOG_MAX, int(math.log1p(d) * _POP_LOG_SCALE)))
 
 
-def decode_pop_density(encoded: int) -> int:
-    if encoded <= 0:
-        return 0
-    return max(1, round(math.expm1(encoded / _POP_LOG_SCALE)))
+def decode_pop_density(e):
+    return 0 if e <= 0 else max(1, round(math.expm1(e / _POP_LOG_SCALE)))
 
 
-# 坡度计算 / Gradient
-
-def compute_max_gradient(data) -> float:
-    if data.size < 4:
-        return 0.0
-    arr = np.asarray(data, dtype=np.float32)
-    gy, gx = np.gradient(arr)
-    return float(np.max(np.sqrt(gx ** 2 + gy ** 2)))
-
-
-def compute_gradient_level(data) -> int:
+def compute_gradient_level(data):
     if data.size < 4:
         return GRADIENT_FLAT
-    max_grad = compute_max_gradient(data)
-    for i, threshold in enumerate(GRADIENT_THRESHOLDS):
-        if max_grad < threshold:
+    a = np.asarray(data, dtype=np.float32)
+    g = float(max(np.max(np.abs(a[1:] - a[:-1])), np.max(np.abs(a[:, 1:] - a[:, :-1]))))
+    for i, t in enumerate(GRADIENT_THRESHOLDS):
+        if g < t: return i
+    return GRADIENT_CLIFF
+
+
+def _precompute_grad_img(dem):
+    """Max per-pixel gradient image (one-time per tile, ~5ms at 1024x1024).
+
+    Each pixel stores the maximum of its horizontal and vertical differences
+    with neighbours.  Per-leaf gradient lookup becomes float(subview.max()),
+    replacing per-leaf compute_gradient_level which allocates 4 tmp arrays.
+    """
+    a = dem.astype(np.float32)
+    gy = np.abs(a[1:, :] - a[:-1, :])
+    gx = np.abs(a[:, 1:] - a[:, :-1])
+    g = np.zeros_like(a)
+    g[:-1, :] = np.maximum(g[:-1, :], gy)
+    g[1:,  :] = np.maximum(g[1:,  :], gy)
+    g[:,  :-1] = np.maximum(g[:,  :-1], gx)
+    g[:,  1:] = np.maximum(g[:,  1:],  gx)
+    return g
+
+
+def _grad_level_from_img(grad_sub):
+    g = float(grad_sub.max()) if grad_sub.size > 0 else 0.0
+    for i, t in enumerate(GRADIENT_THRESHOLDS):
+        if g < t:
             return i
     return GRADIENT_CLIFF
 
 
-# ── 16bit 节点编解码 / 16-bit Node Codec ────────────────────────
+# ── 16-bit Node Codec ─────────────────────────────────────────────
 
-def encode_leaf_node_16(elevation_meters, zone_type, gradient_level=0):
-    is_leaf = 1
-    elev = max(0, min(2047, encode_elevation(elevation_meters)))
-    zone = max(0, min(3, int(zone_type)))
-    grad = max(0, min(3, int(gradient_level)))
-    value = (is_leaf << 15) | (elev << 4) | (grad << 2) | zone
-    return struct.pack('<H', value)
+def encode_leaf_node_16(elev_m, zone, gradient=0):
+    e = max(0, min(2047, encode_elevation(elev_m)))
+    return struct.pack('<H', (1 << 15) | (e << 4) | (max(0, min(3, int(gradient))) << 2)
+                       | max(0, min(3, int(zone))))
 
 
 def encode_branch_node_16(subtree_size):
-    is_leaf = 0
-    size = max(0, min(0x7FFF, int(subtree_size)))
-    value = (is_leaf << 15) | size
-    return struct.pack('<H', value)
+    return struct.pack('<H', max(0, min(0x7FFF, int(subtree_size))))
 
 
-def decode_node_16(raw_bytes):
-    value = struct.unpack('<H', raw_bytes)[0]
-    is_leaf = (value >> 15) & 1
-    if is_leaf:
-        elev_stored = (value >> 4) & 0x7FF
-        return {
-            'is_leaf': True,
-            'elevation': decode_elevation(elev_stored),
-            'elevation_stored': elev_stored,
-            'gradient_level': (value >> 2) & 0x3,
-            'zone': value & 0x3,
-        }
-    return {'is_leaf': False, 'subtree_size': value & 0x7FFF}
+def decode_node_16(raw):
+    v = struct.unpack('<H', raw)[0]
+    if v >> 15:
+        es = (v >> 4) & 0x7FF
+        return {'is_leaf': True, 'elevation': decode_elevation(es),
+                'elevation_stored': es, 'gradient_level': (v >> 2) & 3, 'zone': v & 3}
+    return {'is_leaf': False, 'subtree_size': v & 0x7FFF}
 
 
-def encode_pop_leaf_node(density, urban_zone):
-    is_leaf = 1
-    pop = max(0, min(0xFFF, encode_pop_density(density)))
-    zone = max(0, min(7, int(urban_zone)))
-    value = (is_leaf << 15) | (pop << 3) | zone
-    return struct.pack('<H', value)
+def encode_pop_leaf_node(density, urban):
+    p = max(0, min(0xFFF, encode_pop_density(density)))
+    return struct.pack('<H', (1 << 15) | (p << 3) | max(0, min(7, int(urban))))
 
 
-def decode_pop_leaf_node(raw_bytes):
-    value = struct.unpack('<H', raw_bytes)[0]
-    is_leaf = (value >> 15) & 1
-    if is_leaf:
-        pop_stored = (value >> 3) & 0xFFF
-        return {
-            'is_leaf': True,
-            'pop_density': decode_pop_density(pop_stored),
-            'pop_stored': pop_stored,
-            'urban_zone': value & 0x7,
-        }
-    return {'is_leaf': False, 'subtree_size': value & 0x7FFF}
+def decode_pop_leaf_node(raw):
+    v = struct.unpack('<H', raw)[0]
+    if v >> 15:
+        ps = (v >> 3) & 0xFFF
+        return {'is_leaf': True, 'pop_density': decode_pop_density(ps),
+                'pop_stored': ps, 'urban_zone': v & 7}
+    return {'is_leaf': False, 'subtree_size': v & 0x7FFF}
 
 
 def encode_water_tile():
-    return struct.pack('B', 0xFF)
+    return b'\xff'
 
 
-# ── 旧版32bit节点（兼容） / Legacy 32-bit Node ──────────────────
-
-def encode_leaf_node(elevation_meters, pop_weight, zone_type):
-    is_leaf = 1
-    elev = max(0, min(4095, encode_elevation(elevation_meters)))
-    pop = max(0, min(255, int(pop_weight)))
-    zone = max(0, min(15, int(zone_type)))
-    value = (is_leaf << 31) | (elev << 19) | (pop << 11) | (zone << 7)
-    return struct.pack('<I', value)
+WATER_BYTE = encode_water_tile()
 
 
-def encode_branch_node(child_offset):
-    is_leaf = 0
-    offset = max(0, min(0x7FFFFFFF, int(child_offset)))
-    value = (is_leaf << 31) | offset
-    return struct.pack('<I', value)
+# ── Quadtree Builder (unified) ─────────────────────────────────────
 
-
-def decode_node(raw_bytes):
-    value = struct.unpack('<I', raw_bytes)[0]
-    is_leaf = (value >> 31) & 1
-    if is_leaf:
-        elev_stored = (value >> 19) & 0xFFF
-        return {
-            'is_leaf': True,
-            'elevation': decode_elevation(elev_stored),
-            'elevation_stored': elev_stored,
-            'pop_weight': (value >> 11) & 0xFF,
-            'zone': (value >> 7) & 0xF,
-            'reserved': value & 0x7F,
-        }
-    return {'is_leaf': False, 'child_offset': value & 0x7FFFFFFF}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 四叉树 / Quadtree
-# ═══════════════════════════════════════════════════════════════════
-
-def build_adaptive_tree(dem, zone, pop=None, max_depth=9, max_nodes=MAX_NODES_TERRAIN,
-                        force_depth=FORCE_DEPTH_TERRAIN):
-    """从DEM+zone构建地形四叉树 / Build adaptive terrain quadtree"""
-    node_id = [0]
-    nodes = []
-
-    def _split(data, depth, budget):
-        if node_id[0] >= max_nodes:
-            return
-        h, w = data.shape
-        if h <= 2 or w <= 2:
-            return
-        mid_y, mid_x = h // 2, w // 2
-        quadrants = [data[:mid_y, :mid_x], data[:mid_y, mid_x:],
-                     data[mid_y:, :mid_x], data[mid_y:, mid_x:]]
-        zone_quads = [zone[:mid_y, :mid_x], zone[:mid_y, mid_x:],
-                      zone[mid_y:, :mid_x], zone[mid_y:, mid_x:]]
-        pop_quads = ([pop[:mid_y, :mid_x], pop[:mid_y, mid_x:],
-                      pop[mid_y:, :mid_x], pop[mid_y:, mid_x:]]
-                     if pop is not None else [None] * 4)
-        for ci in range(4):
-            if node_id[0] >= max_nodes:
-                break
-            remaining = max_nodes - node_id[0]
-            alloc = max(1, min(budget // 4, remaining))
-            q_data, q_zone, q_pop = quadrants[ci], zone_quads[ci], pop_quads[ci]
-            if _should_split(q_data, q_zone, q_pop, depth, alloc, force_depth):
-                node_id[0] += 1
-                _split(q_data, depth + 1, alloc)
-            else:
-                node_id[0] += 1
-                _emit_leaf(q_data, q_zone, q_pop)
-
-    _COASTAL_POP_THRESHOLD = 10.0
-
-    def _should_split(data, zone_data, pop_data, depth, budget, fd):
-        if budget <= 1: return False
-        if depth < fd: return True
-        if depth >= max_depth: return False
-        if node_id[0] >= max_nodes: return False
-
-        water_count = int(np.count_nonzero(zone_data == ZONE_WATER))
-        total = zone_data.size
-        has_water = water_count > 0
-        has_land = water_count < total
-
-        if has_water and not has_land:
-            if pop_data is not None and np.any(pop_data > _COASTAL_POP_THRESHOLD):
-                return np.var(data) >= 1.0
-            return False
-
-        if has_water and has_land:
-            return np.var(data) >= 5.0
-
-        if np.var(data) < 1.0: return False
-        return True
-
-    def _emit_leaf(data, zone_data, pop_data):
-        mean_elev = float(np.mean(data))
-        zone_val = int(np.argmax(np.bincount(zone_data.ravel().astype(int))))
-        if mean_elev > 0 and zone_val == ZONE_WATER:
-            zone_val = ZONE_NATURAL
-        grad = compute_gradient_level(data)
-        nodes.append(encode_leaf_node_16(mean_elev, zone_val, grad))
-
-    _split(dem, 0, max_nodes)
-    return encode_branch_node_16(node_id[0]) + b''.join(nodes)
-
-
-def build_adaptive_pop_tree(pop, urban, max_depth=9, max_nodes=MAX_NODES_POP,
-                            force_depth=FORCE_DEPTH_POP):
-    """构建人口自适应四叉树 / Build adaptive population quadtree"""
-    node_id = [0]
-    nodes = []
-
-    def _split(data, urban_data, depth, budget):
-        if node_id[0] >= max_nodes:
-            return
-        h, w = data.shape
-        if h <= 2 or w <= 2:
-            return
-        mid_y, mid_x = h // 2, w // 2
-        quadrants = [data[:mid_y, :mid_x], data[:mid_y, mid_x:],
-                     data[mid_y:, :mid_x], data[mid_y:, mid_x:]]
-        urban_quads = [
-            urban_data[:mid_y, :mid_x] if urban_data is not None else None,
-            urban_data[:mid_y, mid_x:] if urban_data is not None else None,
-            urban_data[mid_y:, :mid_x] if urban_data is not None else None,
-            urban_data[mid_y:, mid_x:] if urban_data is not None else None,
-        ]
-        for ci in range(4):
-            if node_id[0] >= max_nodes:
-                break
-            remaining = max_nodes - node_id[0]
-            alloc = max(1, min(budget // 4, remaining))
-            q_data, q_urban = quadrants[ci], urban_quads[ci]
-            if _should_split_pop(q_data, q_urban, depth, alloc, force_depth):
-                node_id[0] += 1
-                _split(q_data, q_urban, depth + 1, alloc)
-            else:
-                node_id[0] += 1
-                _emit_pop_leaf(q_data, q_urban)
-
-    def _should_split_pop(data, urban_data, depth, budget, fd):
-        if budget <= 1: return False
-        if depth >= max_depth: return False
-        if np.all(data <= _POP_NOISE_FLOOR): return False
-        if depth < fd: return True
-        if urban_data is not None and np.unique(urban_data).size > 2:
-            unique_nonzero = np.unique(urban_data[urban_data > 0])
-            if len(unique_nonzero) > 1: return True
-        if np.var(data) < 10.0: return False
-        return True
-
-    def _emit_pop_leaf(data, urban_data):
-        mean_pop = float(np.mean(data))
-        if urban_data is not None:
-            urban_val = int(np.argmax(np.bincount(urban_data.ravel().astype(int))))
-            if urban_val == URBAN_NONE:
-                if mean_pop > 5000: urban_val = URBAN_COMMERCIAL
-                elif mean_pop > 10: urban_val = URBAN_RESIDENTIAL
+def _quad_split(arrays):
+    quads = [[], [], [], []]
+    for arr in arrays:
+        if arr is None:
+            for q in quads:
+                q.append(None)
         else:
-            if mean_pop > 5000: urban_val = URBAN_COMMERCIAL
-            elif mean_pop > 10: urban_val = URBAN_RESIDENTIAL
-            else: urban_val = URBAN_NONE
-        nodes.append(encode_pop_leaf_node(mean_pop, urban_val))
-
-    _split(pop, urban, 0, max_nodes)
-    return encode_branch_node_16(node_id[0]) + b''.join(nodes)
-
-
-def write_tile_binary(nodes, output_path):
-    from pathlib import Path
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'wb') as f:
-        f.write(nodes)
+            my, mx = arr.shape[0] // 2, arr.shape[1] // 2
+            quads[0].append(arr[:my, :mx])
+            quads[1].append(arr[:my, mx:])
+            quads[2].append(arr[my:, :mx])
+            quads[3].append(arr[my:, mx:])
+    return quads
 
 
-def write_water_tile(output_path):
-    from pathlib import Path
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'wb') as f:
-        f.write(encode_water_tile())
+def _build_quadtree(arrays, should_split_fn, emit_leaf_fn,
+                    max_depth=9, max_nodes=MAX_NODES, force_depth=3):
+    """Build adaptive quadtree. Always produces valid structure (no holes)."""
+    nodes = []
+
+    def _rec(arrs, depth, budget):
+        if arrs[0].shape[0] <= 2 or arrs[0].shape[1] <= 2 or budget < 5:
+            emit_leaf_fn(arrs, nodes)
+            return 1
+        bp = len(nodes)
+        nodes.append(b'\x00\x00')
+        total = 1
+        quads = _quad_split(arrs)
+        decisions = [
+            should_split_fn(q, depth, budget, depth < force_depth)
+            for q in quads
+        ]
+        remaining_budget = max(0, budget - 1)
+        for i, q in enumerate(quads):
+            reserve_for_later = len(quads) - i - 1
+            if remaining_budget <= reserve_for_later:
+                break
+
+            if decisions[i]:
+                remaining_split = max(1, sum(1 for d in decisions[i:] if d))
+                extra = max(0, remaining_budget - (len(quads) - i))
+                alloc = 1 + extra // remaining_split
+                alloc = max(1, min(alloc, remaining_budget - reserve_for_later))
+            else:
+                alloc = 1
+
+            if decisions[i] and alloc >= 5:
+                used = _rec(q, depth + 1, alloc)
+            else:
+                emit_leaf_fn(q, nodes)
+                used = 1
+            total += used
+            remaining_budget -= used
+        nodes[bp] = encode_branch_node_16(total)
+        return total
+
+    _rec(arrays, 0, min(max_nodes, 0x7FFF))
+    return b''.join(nodes)
 
 
-def write_pop_tile_binary(nodes, output_path):
-    from pathlib import Path
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'wb') as f:
-        f.write(nodes)
+def _elevation_needs_split(data, var_threshold=_TERRAIN_VAR):
+    mean = float(data.mean())
+    max_abs_error = max(abs(float(data.min()) - mean), abs(float(data.max()) - mean))
+    return float(data.var()) >= var_threshold or max_abs_error >= _TERRAIN_MAX_ABS_ERROR
 
 
-# ── 导航 / Navigation ───────────────────────────────────────────
+def _zone_needs_split(zone_data):
+    counts = np.bincount(zone_data.ravel().astype(int), minlength=4)
+    total = int(zone_data.size)
+    if total <= 0 or np.count_nonzero(counts) <= 1:
+        return False
+    minority = total - int(counts.max())
+    return (minority / float(total)) >= _ZONE_MIX_MINORITY
 
-def navigate_qtr5(nodes_raw, frac_lat, frac_lon):
-    """导航地形四叉树到指定点 / Navigate terrain quadtree to a point"""
+
+def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
+                        max_nodes=MAX_NODES, force_depth=FORCE_DEPTH_TERRAIN):
+    # Precompute gradient image once — avoids 4 tmp array allocs per leaf
+    grad_img = _precompute_grad_img(dem)
+    pop_arr = pop  # may be None
+
+    # arrays layout: [dem, zone, pop_or_None, grad_img]
+    # grad_img is always arrs[3]; pop is arrs[2] (may be None via _quad_split)
+    def _split(arrs, depth, budget, forced):
+        if budget <= 1: return False
+        if forced: return True
+        if depth >= max_depth: return False
+        d, z = arrs[0], arrs[1]
+        wc = int(np.count_nonzero(z == ZONE_WATER))
+        if wc == z.size:
+            p = arrs[2]
+            return _elevation_needs_split(d) if (p is not None and np.any(p > _COASTAL_POP_PX)) else False
+        if wc > 0:
+            return _zone_needs_split(z) or _elevation_needs_split(d, _WATER_MIX_VAR)
+        if _zone_needs_split(z):
+            return True
+        return _elevation_needs_split(d)
+
+    def _leaf(arrs, nodes):
+        d, z, p, gi = arrs[0], arrs[1], arrs[2], arrs[3]
+        me = d.mean()
+        zv = int(np.argmax(np.bincount(z.ravel().astype(int))))
+        if me > 0 and zv == ZONE_WATER:
+            zv = ZONE_NATURAL
+        elif zv == ZONE_WATER and p is not None and np.any(p > _COASTAL_POP_PX):
+            zv = ZONE_NATURAL
+        nodes.append(encode_leaf_node_16(me, zv, _grad_level_from_img(gi)))
+
+    arrays = [dem, zone, pop_arr, grad_img]
+    return _build_quadtree(arrays, _split, _leaf, max_depth, max_nodes, force_depth)
+
+
+def build_adaptive_pop_tree(pop, urban, max_depth=9,
+                            max_nodes=MAX_NODES, force_depth=FORCE_DEPTH_POP):
+    def _split(arrs, depth, budget, forced):
+        if budget <= 1 or depth >= max_depth: return False
+        if not np.any(arrs[0] > _POP_NOISE_FLOOR): return False
+        if forced: return True
+        u = arrs[1]
+        if u is not None and len(np.unique(u[u > 0])) > 1: return True
+        p = arrs[0]
+        mean_pop = float(p.mean())
+        max_pop = float(p.max())
+        if max_pop >= max(mean_pop * _POP_HOTSPOT_RATIO, mean_pop + _POP_HOTSPOT_DELTA):
+            return True
+        return float(p.var()) >= _POP_VAR
+
+    def _leaf(arrs, nodes):
+        mp = float(arrs[0].mean())
+        u = arrs[1]
+        if u is not None:
+            uv = int(np.argmax(np.bincount(u.ravel().astype(int))))
+            if uv == 0:
+                uv = URBAN_COMMERCIAL if mp > 5000 else (URBAN_RESIDENTIAL if mp > 10 else 0)
+        else:
+            uv = URBAN_COMMERCIAL if mp > 5000 else (URBAN_RESIDENTIAL if mp > 10 else 0)
+        nodes.append(encode_pop_leaf_node(mp, uv))
+
+    return _build_quadtree([pop, urban], _split, _leaf, max_depth, max_nodes, force_depth)
+
+
+# ── Navigation (unified) ──────────────────────────────────────────
+
+def _navigate(nodes_raw, frac_lat, frac_lon, decode_fn):
+    nc = len(nodes_raw) // 2
+    if nc < 1:
+        return None
     pos = 0
-    node_count = len(nodes_raw) // 2
     for _ in range(20):
-        if pos >= node_count:
+        if pos >= nc:
             return None
-        node = decode_node_16(nodes_raw[pos * 2 : pos * 2 + 2])
+        node = decode_fn(nodes_raw[pos * 2:pos * 2 + 2])
         if node['is_leaf']:
             return node
-        quadrant = 0
-        if frac_lon >= 0.5: quadrant += 1
-        if frac_lat < 0.5: quadrant += 2
-        child_pos = pos + 1
-        for i in range(quadrant):
-            if child_pos >= node_count:
+        q = (1 if frac_lon >= 0.5 else 0) + (2 if frac_lat < 0.5 else 0)
+        cp = pos + 1
+        for _ in range(q):
+            if cp >= nc:
                 return None
-            child = decode_node_16(nodes_raw[child_pos * 2 : child_pos * 2 + 2])
-            if child['is_leaf']:
-                child_pos += 1
-            else:
-                child_pos += child['subtree_size']
-        pos = child_pos
+            c = decode_fn(nodes_raw[cp * 2:cp * 2 + 2])
+            cp += 1 if c['is_leaf'] else c['subtree_size']
+        pos = cp
         frac_lat = (frac_lat % 0.5) * 2
         frac_lon = (frac_lon % 0.5) * 2
     return None
+
+
+def navigate_qtr5(nodes_raw, frac_lat, frac_lon):
+    nc = len(nodes_raw) // 2
+    if nc > 1:
+        root = decode_node_16(nodes_raw[0:2])
+        if not root['is_leaf'] and root.get('subtree_size', 0) != nc:
+            return None
+    return _navigate(nodes_raw, frac_lat, frac_lon, decode_node_16)
 
 
 def navigate_qtr5_pop(nodes_raw, frac_lat, frac_lon):
-    """导航人口四叉树到指定点 / Navigate population quadtree to a point"""
-    pos = 0
-    node_count = len(nodes_raw) // 2
-    for _ in range(20):
-        if pos >= node_count:
+    nc = len(nodes_raw) // 2
+    if nc > 1:
+        root = decode_pop_leaf_node(nodes_raw[0:2])
+        if not root['is_leaf'] and root.get('subtree_size', 0) != nc:
             return None
-        node = decode_pop_leaf_node(nodes_raw[pos * 2 : pos * 2 + 2])
-        if node['is_leaf']:
-            return node
-        quadrant = 0
-        if frac_lon >= 0.5: quadrant += 1
-        if frac_lat < 0.5: quadrant += 2
-        child_pos = pos + 1
-        for i in range(quadrant):
-            if child_pos >= node_count:
-                return None
-            child = decode_pop_leaf_node(nodes_raw[child_pos * 2 : child_pos * 2 + 2])
-            if child['is_leaf']:
-                child_pos += 1
-            else:
-                child_pos += child['subtree_size']
-        pos = child_pos
-        frac_lat = (frac_lat % 0.5) * 2
-        frac_lon = (frac_lon % 0.5) * 2
-    return None
+    return _navigate(nodes_raw, frac_lat, frac_lon, decode_pop_leaf_node)
+
+
+# ── Tile I/O & Verification ───────────────────────────────────────
+
+def write_tile_binary(data, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(data)
+
+
+write_pop_tile_binary = write_tile_binary
+
+
+def write_water_tile(path):
+    write_tile_binary(WATER_BYTE, path)
+
+
+def verify_tile(tile_data, decode_fn):
+    """Verify quadtree: root subtree_size matches, sample navigations hit leaves."""
+    nc = len(tile_data) // 2
+    if nc == 0: return False
+    if nc == 1: return decode_fn(tile_data[0:2])['is_leaf']
+    root = decode_fn(tile_data[0:2])
+    if root['is_leaf']: return True
+    if root.get('subtree_size', 0) != nc: return False
+    for fl, flo in [(0.25, 0.25), (0.75, 0.75), (0.5, 0.5), (0.1, 0.9)]:
+        r = _navigate(tile_data, fl, flo, decode_fn)
+        if r is None or not r.get('is_leaf'): return False
+    return True
+
+
+# ── Backward Compatibility ────────────────────────────────────────
+
+GLOBAL_GPK = "data/global.gpk"
+MAX_NODES_TERRAIN = MAX_NODES
+MAX_NODES_POP = MAX_NODES
+STAC_CDSE = "https://stac.dataspace.copernicus.eu/v1"

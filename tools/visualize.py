@@ -22,6 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.collections import LineCollection
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -93,6 +94,68 @@ def _sample_zone_grid(bbox, resolution):
 def _sample_gradient_grid(bbox, resolution):
     """Sample gradient grid / 采样坡度网格"""
     return _sample_grid(bbox, resolution, lambda lat, lon: (query_elevation(lat, lon) or {}).get('gradient_level', np.nan))
+
+
+def _load_tile_blob(tile_dir, lon_int, lat_int, kind):
+    ext = ".qtree" if kind == "terrain" else ".pop"
+    path = Path(tile_dir) / f"{lon_int}_{lat_int}{ext}"
+    if not path.exists():
+        return None
+    return path.read_bytes()
+
+
+def _iter_leaf_boxes(nodes_raw, decode_fn, lat_min, lat_max, lon_min, lon_max):
+    node_count = len(nodes_raw) // 2
+    if node_count == 0:
+        return
+
+    def rec(pos, la0, la1, lo0, lo1):
+        if pos >= node_count:
+            return pos
+        node = decode_fn(nodes_raw[pos * 2: pos * 2 + 2])
+        if node.get("is_leaf", False):
+            yield (la0, la1, lo0, lo1)
+            return pos + 1
+
+        mid_la = (la0 + la1) * 0.5
+        mid_lo = (lo0 + lo1) * 0.5
+        nxt = pos + 1
+        # child order: NW, NE, SW, SE
+        for child_bounds in (
+            (mid_la, la1, lo0, mid_lo),
+            (mid_la, la1, mid_lo, lo1),
+            (la0, mid_la, lo0, mid_lo),
+            (la0, mid_la, mid_lo, lo1),
+        ):
+            sub = rec(nxt, *child_bounds)
+            nxt = yield from sub
+        return nxt
+
+    yield from rec(0, lat_min, lat_max, lon_min, lon_max)
+
+
+def _collect_boundary_segments(bbox, tile_dir, kind="pop", max_leaf_lines=25000):
+    lat0, lon0, lat1, lon1 = bbox
+    segs = []
+    lat_start, lat_end = int(np.floor(lat0)), int(np.floor(lat1))
+    lon_start, lon_end = int(np.floor(lon0)), int(np.floor(lon1))
+    decode_fn = decode_node_16 if kind == "terrain" else decode_pop_leaf_node
+
+    for lat_i in range(lat_start, lat_end + 1):
+        for lon_i in range(lon_start, lon_end + 1):
+            blob = _load_tile_blob(tile_dir, lon_i, lat_i, kind)
+            if not blob or len(blob) <= 1:
+                continue
+            for la0, la1, lo0, lo1 in _iter_leaf_boxes(blob, decode_fn, lat_i, lat_i + 1, lon_i, lon_i + 1):
+                if la1 < lat0 or la0 > lat1 or lo1 < lon0 or lo0 > lon1:
+                    continue
+                segs.append(((lo0, la0), (lo1, la0)))
+                segs.append(((lo1, la0), (lo1, la1)))
+                segs.append(((lo1, la1), (lo0, la1)))
+                segs.append(((lo0, la1), (lo0, la0)))
+                if len(segs) >= max_leaf_lines:
+                    return segs
+    return segs
 
 
 def cmd_elevation(args):
@@ -296,10 +359,10 @@ def cmd_compare(args):
     lat, lon = args.lat, args.lon
     span = max(0.05, float(args.span))
     bbox = (lat - span, lon - span, lat + span, lon + span)
-    resolution = max(40, int(args.resolution))
+    resolution = max(80, int(args.resolution))
 
+    tile_dir = str(Path(args.tile_dir).resolve())
     if args.tile_dir:
-        tile_dir = str(Path(args.tile_dir).resolve())
         os.environ["GEO_BAKER_TILE_DIR"] = tile_dir
         gb_core.TILE_DIR = tile_dir
         gb_io.TILE_DIR = tile_dir
@@ -313,7 +376,11 @@ def cmd_compare(args):
     _, _, elev_grid = _sample_elevation_grid(bbox, resolution)
     _, _, pop_grid = _sample_population_grid(bbox, resolution)
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    min_w = max(1920, int(args.min_width))
+    min_h = max(1080, int(args.min_height))
+    fig_w = max(min_w / float(args.dpi), 16.0)
+    fig_h = max(min_h / float(args.dpi), 10.0)
+    fig, axes = plt.subplots(2, 2, figsize=(fig_w, fig_h))
     extent = [bbox[1], bbox[3], bbox[0], bbox[2]]
 
     im0 = axes[0, 0].imshow(
@@ -357,6 +424,23 @@ def cmd_compare(args):
     )
     axes[1, 1].set_title("Population Density / 人口密度")
     fig.colorbar(im3, ax=axes[1, 1], label="/km²", shrink=0.82)
+
+    if args.show_leaf_boundary != "none":
+        segs_pop = []
+        segs_terrain = []
+        if args.show_leaf_boundary in ("pop", "both"):
+            segs_pop = _collect_boundary_segments(bbox, tile_dir, kind="pop", max_leaf_lines=args.max_leaf_lines)
+        if args.show_leaf_boundary in ("terrain", "both"):
+            segs_terrain = _collect_boundary_segments(bbox, tile_dir, kind="terrain", max_leaf_lines=args.max_leaf_lines)
+
+        if segs_pop:
+            lc = LineCollection(segs_pop, colors="white", linewidths=0.12, alpha=0.55)
+            axes[1, 1].add_collection(lc)
+            if args.show_leaf_boundary == "both":
+                axes[0, 0].add_collection(LineCollection(segs_pop, colors="white", linewidths=0.10, alpha=0.45))
+        if segs_terrain:
+            axes[0, 1].add_collection(LineCollection(segs_terrain, colors="white", linewidths=0.10, alpha=0.50))
+            axes[1, 0].add_collection(LineCollection(segs_terrain, colors="white", linewidths=0.10, alpha=0.45))
 
     for ax in axes.flat:
         ax.set_xlabel("Longitude / 经度")
@@ -404,7 +488,7 @@ def main():
     c = sub.add_parser("compare", help="Compare 4 panels at point / 四联图对比")
     c.add_argument("--lat", type=float, required=True, help="Latitude / 纬度")
     c.add_argument("--lon", type=float, required=True, help="Longitude / 经度")
-    c.add_argument("--resolution", type=int, default=140, help="Grid resolution / 网格分辨率")
+    c.add_argument("--resolution", type=int, default=720, help="Grid resolution / 网格分辨率")
     c.add_argument("--span", type=float, default=0.25, help="Half-span in degrees around point / 采样半径(度)")
     c.add_argument(
         "--tile-dir",
@@ -413,7 +497,17 @@ def main():
         help="Tile directory path / 瓦片目录路径",
     )
     c.add_argument("-o", "--output", type=str, default="compare.png", help="Output path / 输出路径")
-    c.add_argument("--dpi", type=int, default=140, help="Output DPI / 输出DPI")
+    c.add_argument("--dpi", type=int, default=180, help="Output DPI / 输出DPI")
+    c.add_argument("--min-width", type=int, default=1920, help="Minimum output width in pixels / 最小输出宽度像素")
+    c.add_argument("--min-height", type=int, default=1080, help="Minimum output height in pixels / 最小输出高度像素")
+    c.add_argument(
+        "--show-leaf-boundary",
+        type=str,
+        default="none",
+        choices=("none", "pop", "terrain", "both"),
+        help="Overlay quadtree leaf boundaries / 叠加四叉树叶节点边界",
+    )
+    c.add_argument("--max-leaf-lines", type=int, default=25000, help="Boundary segment cap / 边界线段上限")
 
     args = parser.parse_args()
 

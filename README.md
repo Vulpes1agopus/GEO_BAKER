@@ -1,32 +1,31 @@
 # GeoBaker
 
-GeoBaker is a Python pipeline for baking global geospatial rasters into compact
-quadtree tiles for games, simulations, and offline map tooling.
+将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR5 格式），用于游戏、仿真和离线地理查询。
 
-It combines CopDEM elevation, WorldPop population density, and ESA WorldCover
-land-cover classes into two runtime-friendly products:
+**文档**：见 [docs/README.md](docs/README.md)（[总览](docs/overview.md) · [技术参考](docs/technical_reference.md)）。
 
-- QTR5 tile files under `tiles/`
-- optional GeoPack bundles such as `terrain.dat` and `population.dat`
+> 公开仓库只保存源码、文档、小型元数据和测试。`tiles/`、`terrain.dat`、`population.dat`、日志、缓存、预览图和备份包都是本地生成物，不纳入 Git。
 
-Generated tiles, packs, logs, previews, caches, and backups are intentionally
-ignored by Git. Keep this repository source-only; publish data packs separately.
+## 特性
 
-## Features
+- **多源数据融合**：DEM (30m) + 人口 (1km) + 地表类型 (100m)，默认使用公开数据源，无需项目私有凭据。
+- **自适应四叉树 (QTR5)**：16bit 节点、非线性海拔编码、动态节点预算。
+- **紧凑二进制格式**：支持 zstd 压缩的 GeoPack，360 x 180 网格索引，适合随机访问。
+- **水陆一致性处理**：NO_DATA 瓦片可结合 ESA WorldCover 判断水陆，避免盲写水瓦片。
+- **沿海城市修正**：用人口栅格辅助修正海岸线附近的水陆误判。
+- **增量打包**：仅重新打包新增或变更瓦片。
+- **诊断工具**：查询、验证、大小分析、城市抽样验证和可视化出图。
 
-- Adaptive quadtree encoding for terrain and population.
-- 16-bit node format with nonlinear elevation and logarithmic population
-  encoding.
-- Separate terrain and population trees, so games can stream only what they
-  need.
-- Budget-aware splitting to keep tile size predictable.
-- Coastal consistency pass that uses population to avoid marking inhabited
-  coastlines as water.
-- GeoPack export with a fixed 360 x 180 tile index and zstd-compressed tile
-  payloads.
-- CLI tools for baking, querying, validation, tile inspection, and visualization.
+## 数据源
 
-## Install
+| 数据 | 来源 | 分辨率 | 认证 |
+| --- | --- | --- | --- |
+| CopDEM GLO-30 | Planetary Computer / Element84 STAC | 30m | 无需项目私有凭据 |
+| Open-Elevation | REST API（降级备用） | ~100m | 无需项目私有凭据 |
+| WorldPop | ArcGIS ImageServer | 1km | 无需项目私有凭据 |
+| ESA WorldCover | Planetary Computer STAC | 100m | 无需项目私有凭据 |
+
+## 快速开始
 
 ```bash
 python3 -m venv .venv
@@ -34,109 +33,397 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Or install the package in editable mode:
+也可以以可编辑模式安装：
 
 ```bash
 pip install -e .
 ```
 
-GeoBaker downloads public geospatial datasets from third-party services. The
-default pipeline does not require project-specific credentials.
-
-## Quick Start
-
-Bake one 1-degree tile:
+烘焙单个瓦片：
 
 ```bash
 python -m geo_baker_pkg --tile 116,39
 ```
 
-Query a point from local tile files:
+查询一个点：
 
 ```bash
 python -m geo_baker_pkg --query 39.9 116.4
 ```
 
-Bake a bounding box:
+查看统计：
 
 ```bash
-python -m geo_baker_pkg --bbox 70 20 140 55 --workers 8 --conn 64
+python -m geo_baker_pkg --stats
 ```
 
-Export packed runtime files:
+试运行（估算，不下载）：
 
 ```bash
-python -m geo_baker_pkg --pack
-python -m geo_baker_pkg --pack-pop
+python -m geo_baker_pkg --global --dry-run
 ```
 
-Visualize a point as a four-panel diagnostic image:
+## 用法
 
-```bash
-python tools/visualize.py compare --lat 31.2304 --lon 121.4737 -o shanghai.png
-```
+### 烘焙（数据处理）
 
-## CLI Overview
-
-| Command | Purpose |
+| 命令 | 说明 |
 | --- | --- |
-| `--tile LON,LAT` | Bake one tile. |
-| `--bbox W S E N` | Bake a rectangular region. |
-| `--global` | Bake all global land/ocean tiles. |
-| `--retry-errors` | Retry tiles marked as failed. |
-| `--fix-pop-zone` | Re-bake tiles where population and terrain zone disagree. |
-| `--pack` | Build `terrain.dat`. |
-| `--pack-pop` | Build `population.dat`. |
-| `--query LAT LON` | Query local tile files. |
-| `--query-pack LAT LON` | Query packed terrain data. |
-| `--stats` | Print local tile statistics. |
+| `--tile 116,39` | 烘焙单个 1 度瓦片 |
+| `--bbox 70 20 140 55` | 烘焙区域 |
+| `--global` | 烘焙全球 |
+| `--global --split 2/1` | 分布式烘焙：第 1 份，共 2 份 |
+| `--global --bake-ocean` | 不跳过海洋瓦片，下载 DEM 处理 |
+| `--global --no-data-water` | NO_DATA 瓦片直接写水瓦片，跳过 zone 检查 |
+| `--retry-errors` | 重试失败瓦片 |
+| `--fix-coastal` | 检测并修复沿海问题瓦片 |
+| `--fix-pop-zone` | 自动修复人口/城镇与 zone 冲突瓦片 |
 
-## Repository Layout
+### 打包（二进制导出）
+
+| 命令 | 说明 |
+| --- | --- |
+| `--pack` | 打包地形为 `terrain.dat` |
+| `--pack-pop` | 打包人口为 `population.dat` |
+| `--incremental-pack` | 增量打包，仅处理新增或变更瓦片 |
+| `--merge a.dat b.dat` | 合并两个 `.dat` 文件 |
+
+### 查询
+
+| 命令 | 说明 |
+| --- | --- |
+| `--query 39.9 116.4` | 从瓦片文件查询海拔 + 人口 |
+| `--query-pack 39.9 116.4` | 从 `terrain.dat` 查询 |
+| `--query-pop 39.9 116.4` | 仅查询人口 |
+| `--stats` | 瓦片统计 |
+
+### 工具
+
+```bash
+# 检查与验证
+python tools/geo_inspect.py query 39.9 116.4
+python tools/geo_inspect.py tile-info 116 39
+python tools/geo_inspect.py stats
+python tools/geo_inspect.py validate
+python tools/geo_inspect.py validate --fix-ocean
+python tools/geo_inspect.py size-report
+python tools/verify_cities.py --cities data/global_cities.json
+
+# 可视化
+python tools/visualize.py elevation --bbox 70 20 140 55 -o china_elev.png
+python tools/visualize.py population --bbox 70 20 140 55 -o china_pop.png
+python tools/visualize.py zones --bbox 70 20 140 55 -o china_zones.png
+python tools/visualize.py overview --pack terrain.dat -o global.png
+python tools/visualize.py compare --lat 39.9 --lon 116.4 -o beijing.png
+
+# 后台烘焙（低优先级）
+bash tools/bake_background.sh
+bash tools/bake_background.sh --retry
+bash tools/bake_background.sh --region 70 20 140 55
+```
+
+## 项目结构
 
 ```text
 GeoBaker/
-├── geo_baker_pkg/       # Core package: encoding, quadtree, baking, packing, CLI
-├── tools/               # Inspection, verification, visualization helpers
-├── scripts/             # Optional data-prep and utility scripts
-├── tests/               # Unit tests for quadtree, IO, and pipeline controls
-├── data/                # Small metadata files safe to commit
-├── docs/                # Architecture and format notes
-├── README.md
-├── CHANGELOG.md
-├── LICENSE
-└── pyproject.toml
+├── geo_baker_pkg/               # 核心包
+│   ├── core.py                  # 常量、编码、四叉树
+│   ├── pipeline.py              # 数据下载、对齐、修正和烘焙编排
+│   ├── io.py                    # QTR5/GeoPack 打包和查询
+│   └── cli.py                   # 命令行入口
+├── tools/                       # 查询、验证、可视化工具
+│   ├── geo_inspect.py
+│   ├── visualize.py
+│   ├── verify_cities.py
+│   └── bake_background.sh
+├── scripts/                     # 可选数据准备和渲染脚本
+│   ├── borders/
+│   ├── interop_export/
+│   ├── visualization/
+│   ├── verify.py
+│   └── quad_view.py
+├── tests/                       # 单元测试
+├── data/                        # 小型元数据，如城市验证列表
+└── docs/                        # 架构和格式说明
 ```
 
-Ignored local/generated directories include `tiles/`, `logs/`, `cache/`,
-`images/`, `backups/`, `.venv/`, and binary packs such as `*.dat`.
+## 架构
 
-## Data Model
-
-QTR5 stores nodes in DFS pre-order:
+### QTR5 格式（16bit 节点）
 
 ```text
-terrain leaf: [1 bit leaf][11 bit elevation][2 bit gradient][2 bit zone]
-pop leaf:     [1 bit leaf][12 bit population][3 bit urban type]
-branch:       [1 bit branch][15 bit subtree size]
+地形叶节点: [1bit is_leaf=1][11bit 海拔(非线性)][2bit 坡度][2bit 区域]
+人口叶节点: [1bit is_leaf=1][12bit 人口密度(对数)][3bit 城市类型]
+分支节点:   [1bit is_leaf=0][15bit subtree_size]
 ```
 
-The runtime reader navigates by skipping subtrees with `subtree_size`, so a point
-query is `O(depth)` with no child-offset table.
+- **非线性海拔**：0-511m @ 1m 精度，512-1535m @ 2m，1536-3583m @ 4m，3584-8190m @ 8m。
+- **人口编码**：12bit 对数编码，覆盖低密度乡村到高密度城市。
+- **DFS 前序遍历**：通过 `subtree_size` 跳过子树，点查询复杂度约为 `O(depth)`。
 
-See [docs/overview.md](docs/overview.md) and
-[docs/technical_reference.md](docs/technical_reference.md) for more detail.
+### 数据管线
 
-## Public-Repo Hygiene
+```text
+STAC API (CopDEM/ESA) ──┐
+WorldPop ArcGIS ────────┤──→ 下载 ─→ 对齐 ─→ 修正 ─→ 四叉树 ─→ 打包 ─→ .dat
+                        └── 降级备用数据源
+```
 
-Before publishing:
+### 降级链
+
+- **DEM**：Planetary Computer → Element84 → Open-Elevation
+- **地表类型**：ESA WorldCover
+
+### NO_DATA 瓦片处理
+
+当 DEM 下载失败或返回 NO_DATA 时，可以结合 ESA WorldCover 判断水陆：
+
+1. 下载 ESA WorldCover zone 数据。
+2. 若水体占比足够高，写 1 字节水瓦片。
+3. 否则返回 no_data 状态，等待后续重试或人工检查。
+4. `--no-data-water` 可跳过 zone 下载，直接写水瓦片，适合明确知道目标区域是海洋的批处理。
+
+### 沿海城市修正
+
+海岸线附近常见问题是 DEM 或地表分类把有人口的沿海城区标成水。GeoBaker 会用人口作为辅助证据：
+
+1. `fix_water_consistency`：`zone=WATER` 且 `pop` 高于阈值的像素修正为陆地类。
+2. `_enforce_water_value_consistency`：明显水体像素保留为水。
+3. `_enforce_water_zone_consistency`：水体上的人口和 urban 数据清零。
+4. 四叉树构建时继续保护有人口的小区域，避免粗化后又变回水。
+
+## 输出格式
+
+### `terrain.dat` / `population.dat` (GeoPack)
+
+| 区域 | 大小 | 说明 |
+| --- | --- | --- |
+| Header | 32 bytes | Magic、网格维度、瓦片数、标志 |
+| Index | 1,036,800 bytes | 360 x 180 网格的 `(offset, size)` 对 |
+| Data | 可变 | zstd 压缩的瓦片数据块 |
+
+### 瓦片二进制 (QTR5)
+
+- **水域瓦片**：1 字节 (`0xFF`)
+- **数据瓦片**：2 x N 字节，16bit 节点数组，DFS 前序
+
+## 许可证
+
+MIT License，详见 [LICENSE](LICENSE)。
+
+---
+
+# GeoBaker (English)
+
+GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR5 format) for games, simulations, and offline geospatial queries.
+
+**Docs**: see [docs/README.md](docs/README.md), [overview](docs/overview.md), and [technical reference](docs/technical_reference.md).
+
+> The public repository is source-first. `tiles/`, `terrain.dat`, `population.dat`, logs, caches, preview images, and backups are generated locally and are not committed.
+
+## Features
+
+- **Multi-source data fusion**: DEM (30m), population (1km), and land cover (100m), using public data sources by default.
+- **Adaptive quadtree (QTR5)**: 16-bit nodes, nonlinear elevation encoding, and budget-aware splitting.
+- **Compact binary format**: zstd-compressed GeoPack files with a 360 x 180 tile index.
+- **Water/land consistency**: optional ESA-based handling for NO_DATA tiles instead of blindly writing water.
+- **Coastal city correction**: uses population as supporting evidence for inhabited coastlines.
+- **Incremental packing**: re-pack only new or changed tiles.
+- **Diagnostic tools**: query, validation, size reports, city sampling, and visualization.
+
+## Data Sources
+
+| Data | Source | Resolution | Auth |
+| --- | --- | --- | --- |
+| CopDEM GLO-30 | Planetary Computer / Element84 STAC | 30m | No project-specific credential |
+| Open-Elevation | REST API fallback | ~100m | No project-specific credential |
+| WorldPop | ArcGIS ImageServer | 1km | No project-specific credential |
+| ESA WorldCover | Planetary Computer STAC | 100m | No project-specific credential |
+
+## Quick Start
 
 ```bash
-git status --short
-git ls-files | grep -E '(^tiles/|\.dat$|\.png$|\.log$|backups/|cache/)'
-gitleaks detect --source .
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-The second command should print nothing for a source-only public repository.
+Editable install:
+
+```bash
+pip install -e .
+```
+
+Bake one tile:
+
+```bash
+python -m geo_baker_pkg --tile 116,39
+```
+
+Query a point:
+
+```bash
+python -m geo_baker_pkg --query 39.9 116.4
+```
+
+Show stats:
+
+```bash
+python -m geo_baker_pkg --stats
+```
+
+Dry run:
+
+```bash
+python -m geo_baker_pkg --global --dry-run
+```
+
+## Usage
+
+### Baking
+
+| Command | Description |
+| --- | --- |
+| `--tile 116,39` | Bake one 1-degree tile |
+| `--bbox 70 20 140 55` | Bake a region |
+| `--global` | Bake globally |
+| `--global --split 2/1` | Distributed bake, part 1 of 2 |
+| `--global --bake-ocean` | Do not skip ocean tiles |
+| `--global --no-data-water` | Write NO_DATA tiles as water directly |
+| `--retry-errors` | Retry failed tiles |
+| `--fix-coastal` | Detect and fix coastal problem tiles |
+| `--fix-pop-zone` | Auto-fix population/urban vs terrain-zone conflicts |
+
+### Packing
+
+| Command | Description |
+| --- | --- |
+| `--pack` | Pack terrain into `terrain.dat` |
+| `--pack-pop` | Pack population into `population.dat` |
+| `--incremental-pack` | Pack only new or changed tiles |
+| `--merge a.dat b.dat` | Merge two `.dat` files |
+
+### Querying
+
+| Command | Description |
+| --- | --- |
+| `--query 39.9 116.4` | Query elevation and population from tile files |
+| `--query-pack 39.9 116.4` | Query from `terrain.dat` |
+| `--query-pop 39.9 116.4` | Query population only |
+| `--stats` | Tile statistics |
+
+### Tools
+
+```bash
+# Inspection and validation
+python tools/geo_inspect.py query 39.9 116.4
+python tools/geo_inspect.py tile-info 116 39
+python tools/geo_inspect.py stats
+python tools/geo_inspect.py validate
+python tools/geo_inspect.py validate --fix-ocean
+python tools/geo_inspect.py size-report
+python tools/verify_cities.py --cities data/global_cities.json
+
+# Visualization
+python tools/visualize.py elevation --bbox 70 20 140 55 -o china_elev.png
+python tools/visualize.py population --bbox 70 20 140 55 -o china_pop.png
+python tools/visualize.py zones --bbox 70 20 140 55 -o china_zones.png
+python tools/visualize.py overview --pack terrain.dat -o global.png
+python tools/visualize.py compare --lat 39.9 --lon 116.4 -o beijing.png
+
+# Background baking
+bash tools/bake_background.sh
+bash tools/bake_background.sh --retry
+bash tools/bake_background.sh --region 70 20 140 55
+```
+
+## Project Structure
+
+```text
+GeoBaker/
+├── geo_baker_pkg/               # Core package
+│   ├── core.py                  # Constants, encoding, quadtree
+│   ├── pipeline.py              # Download, align, fix, and bake orchestration
+│   ├── io.py                    # QTR5/GeoPack packing and querying
+│   └── cli.py                   # CLI entry point
+├── tools/                       # Query, validation, and visualization tools
+│   ├── geo_inspect.py
+│   ├── visualize.py
+│   ├── verify_cities.py
+│   └── bake_background.sh
+├── scripts/                     # Optional data-preparation and rendering scripts
+│   ├── borders/
+│   ├── interop_export/
+│   ├── visualization/
+│   ├── verify.py
+│   └── quad_view.py
+├── tests/                       # Unit tests
+├── data/                        # Small metadata files, such as city validation lists
+└── docs/                        # Architecture and format notes
+```
+
+## Architecture
+
+### QTR5 Format (16-bit Nodes)
+
+```text
+Terrain leaf:    [1bit is_leaf=1][11bit elevation(non-linear)][2bit gradient][2bit zone]
+Population leaf: [1bit is_leaf=1][12bit pop density(log)][3bit urban type]
+Branch node:     [1bit is_leaf=0][15bit subtree_size]
+```
+
+- **Nonlinear elevation**: compact meter buckets for low and high terrain.
+- **Population encoding**: logarithmic 12-bit density encoding.
+- **DFS pre-order traversal**: navigate by skipping subtrees with `subtree_size`.
+
+### Data Pipeline
+
+```text
+STAC API (CopDEM/ESA) ──┐
+WorldPop ArcGIS ────────┤──→ Download ─→ Align ─→ Fix ─→ Quadtree ─→ Pack ─→ .dat
+                        └── Fallback sources
+```
+
+### Fallback Chains
+
+- **DEM**: Planetary Computer → Element84 → Open-Elevation
+- **Land cover**: ESA WorldCover
+
+### NO_DATA Tile Handling
+
+When DEM download fails or returns NO_DATA, GeoBaker can use ESA WorldCover to
+decide whether a tile is likely water:
+
+1. Download ESA WorldCover zone data.
+2. If water ratio is high enough, write a 1-byte water tile.
+3. Otherwise return no_data for later retry or inspection.
+4. `--no-data-water` skips the zone check and writes water directly, which is
+   useful only when the target region is known to be ocean.
+
+### Coastal City Correction
+
+Coastline-adjacent data can classify inhabited land as water. GeoBaker uses
+population as supporting evidence:
+
+1. `fix_water_consistency` fixes `zone=WATER` pixels with meaningful population.
+2. `_enforce_water_value_consistency` keeps obvious water as water.
+3. `_enforce_water_zone_consistency` clears population and urban metadata on water.
+4. Quadtree building keeps small populated areas from being averaged back into water.
+
+## Output Format
+
+### `terrain.dat` / `population.dat` (GeoPack)
+
+| Section | Size | Description |
+| --- | --- | --- |
+| Header | 32 bytes | Magic, grid dimensions, tile count, flags |
+| Index | 1,036,800 bytes | 360 x 180 grid of `(offset, size)` pairs |
+| Data | Variable | zstd-compressed tile payloads |
+
+### Tile Binary (QTR5)
+
+- **Water tile**: 1 byte (`0xFF`)
+- **Data tile**: 2 x N bytes, 16-bit node array in DFS pre-order
 
 ## License
 

@@ -111,6 +111,10 @@ python tools/visualize.py population --bbox 70 20 140 55 -o china_pop.png
 python tools/visualize.py zones --bbox 70 20 140 55 -o china_zones.png
 python tools/visualize.py overview --pack terrain.dat -o global.png
 python tools/visualize.py compare --lat 39.9 --lon 116.4 -o beijing.png
+python tools/geo_suite.py quad-view --city 39.9 116.4 --span 1.0 -o beijing_quad.png
+python tools/geo_suite.py heatmaps --lat-min 39.75 --lat-max 40.05 --lon-min 116.2 --lon-max 116.6 -o beijing_heatmaps.png
+python tools/geo_suite.py geojson --input data/boundary.geojson -o boundary.png
+python tools/geo_suite.py verify --check all --pop-threshold 10
 
 # 后台烘焙（低优先级）
 bash tools/bake_background.sh
@@ -130,9 +134,9 @@ GeoBaker/
 ├── tools/                       # 查询、验证、可视化工具
 │   ├── geo_inspect.py
 │   ├── visualize.py
+│   ├── geo_suite.py             # 合并 verify/quad-view/geojson/heatmaps
 │   ├── verify_cities.py
 │   └── bake_background.sh
-├── scripts/visualization/       # 可选可视化辅助脚本
 ├── tests/                       # 单元测试
 └── data/                        # 小型元数据，如城市验证列表
 ```
@@ -344,6 +348,10 @@ python tools/visualize.py population --bbox 70 20 140 55 -o china_pop.png
 python tools/visualize.py zones --bbox 70 20 140 55 -o china_zones.png
 python tools/visualize.py overview --pack terrain.dat -o global.png
 python tools/visualize.py compare --lat 39.9 --lon 116.4 -o beijing.png
+python tools/geo_suite.py quad-view --city 39.9 116.4 --span 1.0 -o beijing_quad.png
+python tools/geo_suite.py heatmaps --lat-min 39.75 --lat-max 40.05 --lon-min 116.2 --lon-max 116.6 -o beijing_heatmaps.png
+python tools/geo_suite.py geojson --input data/boundary.geojson -o boundary.png
+python tools/geo_suite.py verify --check all --pop-threshold 10
 
 # Background baking
 bash tools/bake_background.sh
@@ -363,9 +371,9 @@ GeoBaker/
 ├── tools/                       # Query, validation, and visualization tools
 │   ├── geo_inspect.py
 │   ├── visualize.py
+│   ├── geo_suite.py             # Unified verify/quad-view/geojson/heatmaps tool
 │   ├── verify_cities.py
 │   └── bake_background.sh
-├── scripts/visualization/       # Optional visualization helper scripts
 ├── tests/                       # Unit tests
 └── data/                        # Small metadata files, such as city validation lists
 ```

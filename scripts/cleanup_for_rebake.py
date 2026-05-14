@@ -159,11 +159,11 @@ def main():
     print(f"\n      Remaining tiles: {remaining_qtree} qtree, {remaining_pop} pop")
 
     print(f"\n{'=' * 60}")
-    print(f"Ready! Run the following command:")
-    print(f"  screen -dmS geo_global bash -c 'cd /home/fanziyu/geo_baker && \\")
-    print(f"      nice -n 10 PYTHONUNBUFFERED=1 python3 -u -m geo_baker_pkg \\")
+    print(f"Ready! From the repository root, run:")
+    print(f"  screen -dmS geo_global bash -c '\\")
+    print(f"      nice -n 10 env PYTHONUNBUFFERED=1 python3 -u -m geo_baker_pkg \\")
     print(f"      --global --workers 12 --conn 80 \\")
-    print(f"      2>&1 | tee bake_global_r5.log; exec bash'")
+    print(f"      2>&1 | tee logs/bake_global.log; exec bash'")
     print(f"{'=' * 60}")
 
 

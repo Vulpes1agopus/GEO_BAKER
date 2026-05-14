@@ -7,12 +7,20 @@ Land cover: ESA WorldCover (Planetary Computer STAC)
 Coastal fix: population as ground truth for water/land correction.
 """
 
+import json
 import os
 import time
 import logging
 import numpy as np
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED, CancelledError
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+    FIRST_COMPLETED,
+    CancelledError,
+)
 
 from .core import (
     TILE_DIR, STAC_PC, STAC_E84,
@@ -28,15 +36,88 @@ from .core import (
 
 logger = logging.getLogger('geo_baker')
 
+DEFAULT_TERRAIN_NODE_CAP = max(5000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_TERRAIN_NODE_CAP", "24000"))))
+DEFAULT_POP_NODE_CAP = max(3000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_POP_NODE_CAP", "20000"))))
 
-# ── Land Tile Index ────────────────────────────────────────────────
+
+# ── Land Tile Index (ESA WorldCover via STAC) ───────────────────────
 
 _land_tile_cache = None
+_LAND_INDEX_CACHE_FILE = os.environ.get(
+    "GEO_BAKER_LAND_INDEX_CACHE",
+    os.path.join(os.path.dirname(__file__), "..", "data", "land_tiles.json"),
+)
+
+# If the STAC-derived land set is smaller than this, do not trust is_likely_ocean for bulk fixes
+# (APIs may cap items; a sparse index makes whole latitude bands look like “ocean”).
+MIN_LAND_INDEX_TILES_TRUST = 12_000
+
+
+def _load_land_tile_cache():
+    p = Path(_LAND_INDEX_CACHE_FILE)
+    if not p.is_file():
+        return None
+    try:
+        with p.open(encoding="utf-8") as f:
+            payload = json.load(f)
+        tiles = payload.get("tiles", payload)
+        land = {(int(la), int(lo)) for la, lo in tiles}
+        if land:
+            logger.info("[LAND-INDEX] Loaded %s cells from %s", len(land), p)
+            return land
+    except Exception as e:
+        logger.warning("[LAND-INDEX] Failed to read cache %s: %s", p, e)
+    return None
+
+
+def _save_land_tile_cache(land):
+    if len(land) < MIN_LAND_INDEX_TILES_TRUST:
+        return
+    p = Path(_LAND_INDEX_CACHE_FILE)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "source": "esa-worldcover-stac",
+            "min_trust_count": MIN_LAND_INDEX_TILES_TRUST,
+            "count": len(land),
+            "tiles": sorted([list(x) for x in land]),
+        }
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        tmp.replace(p)
+        logger.info("[LAND-INDEX] Saved %s cells to %s", len(land), p)
+    except Exception as e:
+        logger.warning("[LAND-INDEX] Failed to write cache %s: %s", p, e)
+
+
+def _esa_worldcover_land_tiles_in_bbox(cat, bbox_lonlat):
+    """1° cells touched by esa-worldcover item bboxes inside (lon_min, lat_min, lon_max, lat_max)."""
+    lon_min, lat_min, lon_max, lat_max = bbox_lonlat
+    out = set()
+    search = cat.search(
+        collections=["esa-worldcover"],
+        bbox=[lon_min, lat_min, lon_max, lat_max],
+        max_items=2_000_000,
+    )
+    for item in search.items():
+        b = item.bbox
+        if not b or len(b) < 4:
+            continue
+        for la in range(int(np.floor(b[1])), int(np.ceil(b[3])) + 1):
+            for lo in range(int(np.floor(b[0])), int(np.ceil(b[2])) + 1):
+                if -90 <= la < 90 and -180 <= lo < 180:
+                    out.add((la, lo))
+    return out
 
 
 def _build_land_tile_set():
     global _land_tile_cache
     if _land_tile_cache is not None:
+        return _land_tile_cache
+    cached = _load_land_tile_cache()
+    if cached is not None:
+        _land_tile_cache = cached
         return _land_tile_cache
     land = set()
     try:
@@ -46,23 +127,37 @@ def _build_land_tile_set():
             cat = pystac_client.Client.open(STAC_PC, modifier=planetary_computer.sign_inplace)
         except Exception:
             cat = pystac_client.Client.open(STAC_PC)
-        for item in cat.search(collections=["esa-worldcover"],
-                               bbox=[-180, -90, 180, 90], max_items=None).items():
-            b = item.bbox
-            if not b or len(b) < 4: continue
-            for la in range(int(np.floor(b[1])), int(np.ceil(b[3])) + 1):
-                for lo in range(int(np.floor(b[0])), int(np.ceil(b[2])) + 1):
-                    if -90 <= la < 90 and -180 <= lo < 180:
-                        land.add((la, lo))
-    except Exception:
-        pass
+        for bbox in (
+            (-180, -90, 0, 0),
+            (0, -90, 180, 0),
+            (-180, 0, 0, 90),
+            (0, 0, 180, 90),
+        ):
+            land |= _esa_worldcover_land_tiles_in_bbox(cat, bbox)
+        if len(land) < MIN_LAND_INDEX_TILES_TRUST:
+            logger.warning(
+                "[LAND-INDEX] Sparse after quadrants (%s); merging full-bbox pass",
+                len(land),
+            )
+            land |= _esa_worldcover_land_tiles_in_bbox(cat, (-180, -90, 180, 90))
+    except Exception as e:
+        logger.warning("[LAND-INDEX] ESA STAC land index failed: %s", e)
+        land = set()
+    _save_land_tile_cache(land)
     _land_tile_cache = land
     return land
 
 
+def land_index_sufficient():
+    """True if ESA land tile count is large enough for ocean/land heuristics."""
+    return len(_build_land_tile_set()) >= MIN_LAND_INDEX_TILES_TRUST
+
+
 def is_likely_ocean(lat, lon):
     land = _build_land_tile_set()
-    return bool(land) and (int(np.floor(lat)), int(np.floor(lon))) not in land
+    if len(land) < MIN_LAND_INDEX_TILES_TRUST:
+        return False
+    return (int(np.floor(lat)), int(np.floor(lon))) not in land
 
 
 # ── STAC Utilities ─────────────────────────────────────────────────
@@ -328,6 +423,32 @@ def _write_water(lat, lon):
         write_water_tile(p)
 
 
+def _tile_node_budgets(zone, pop):
+    terrain_cap = DEFAULT_TERRAIN_NODE_CAP
+    pop_cap = DEFAULT_POP_NODE_CAP
+    if zone is None:
+        return terrain_cap, pop_cap
+
+    z = np.asarray(zone)
+    counts = np.bincount(z.ravel().astype(int), minlength=4)
+    zone_mixed = np.count_nonzero(counts) > 1
+    water_mixed = counts[ZONE_WATER] > 0 and counts[ZONE_WATER] < z.size
+    max_pop = float(np.nanmax(pop)) if pop is not None and pop.size else 0.0
+
+    if water_mixed or zone_mixed or max_pop > 50:
+        terrain_budget = terrain_cap
+    else:
+        terrain_budget = min(terrain_cap, 12000)
+
+    if max_pop > 1000:
+        pop_budget = pop_cap
+    elif max_pop > 10:
+        pop_budget = min(pop_cap, 12000)
+    else:
+        pop_budget = min(pop_cap, 4000)
+    return terrain_budget, pop_budget
+
+
 def _compute_tile(lat, lon, dem, pop, zone, urban):
     Path(TILE_DIR).mkdir(parents=True, exist_ok=True)
     has_pop = pop is not None and np.any(pop > 10.0)
@@ -336,33 +457,38 @@ def _compute_tile(lat, lon, dem, pop, zone, urban):
         return {'status': 'water', 'nodes': 0}
 
     qtree_path, pop_path = _tile_paths(lat, lon)
+    terrain_budget, pop_budget = _tile_node_budgets(zone, pop)
 
-    terrain = build_adaptive_tree(dem, zone, pop)
+    terrain = build_adaptive_tree(dem, zone, pop, max_nodes=terrain_budget)
     if not verify_tile(terrain, decode_node_16):
         logger.error(f"[VERIFY] {lon}_{lat}: terrain tree FAILED verification")
     write_tile_binary(terrain, qtree_path)
     nc = len(terrain) // 2
-    if nc >= MAX_NODES - 64:
-        logger.warning(f"[BUDGET] {lon}_{lat}: terrain nodes near MAX_NODES ({nc}/{MAX_NODES})")
+    if nc >= terrain_budget - 64:
+        logger.warning(f"[BUDGET] {lon}_{lat}: terrain nodes near budget ({nc}/{terrain_budget})")
 
     pnc = 0
     if pop is not None:
-        pop_tree = build_adaptive_pop_tree(pop, urban)
+        pop_tree = build_adaptive_pop_tree(pop, urban, max_nodes=pop_budget)
         if not verify_tile(pop_tree, decode_pop_leaf_node):
             logger.error(f"[VERIFY] {lon}_{lat}: pop tree FAILED verification")
         write_tile_binary(pop_tree, pop_path)
         pnc = len(pop_tree) // 2
-        if pnc >= MAX_NODES - 64:
-            logger.warning(f"[BUDGET] {lon}_{lat}: pop nodes near MAX_NODES ({pnc}/{MAX_NODES})")
+        if pnc >= pop_budget - 64:
+            logger.warning(f"[BUDGET] {lon}_{lat}: pop nodes near budget ({pnc}/{pop_budget})")
 
-    return {'status': 'ok', 'nodes': nc, 'detail': f"nodes={nc}, pop_nodes={pnc}"}
+    return {
+        'status': 'ok',
+        'nodes': nc,
+        'detail': f"nodes={nc}/{terrain_budget}, pop_nodes={pnc}/{pop_budget}",
+    }
 
 
 def _bake_tile_core(lat, lon, offline=False, max_conn=200,
                     skip_ocean=True, no_data_water=False):
     t0 = time.time()
 
-    if is_likely_ocean(lat, lon):
+    if skip_ocean and is_likely_ocean(lat, lon):
         esa = _download_esa(lat, lon)
         if esa is not None:
             zg = np.full_like(esa, ZONE_NATURAL, dtype=np.uint8)
@@ -423,8 +549,10 @@ def _bake_tile_worker(lat, lon, offline=False, max_conn=200,
         return {'status': 'error', 'nodes': 0, 'detail': str(e)}
 
 
-def bake_tile(lat, lon, offline=False, max_conn=200):
-    return _bake_tile_core(lat, lon, offline=offline, max_conn=max_conn)
+def bake_tile(lat, lon, offline=False, max_conn=200, skip_ocean=True,
+              no_data_water=False):
+    return _bake_tile_core(lat, lon, offline=offline, max_conn=max_conn,
+                           skip_ocean=skip_ocean, no_data_water=no_data_water)
 
 
 # ── Batch Processing ──────────────────────────────────────────────────
@@ -434,7 +562,8 @@ DEFAULT_BATCH_IDLE_TIMEOUT_S = 900
 
 
 def _run_tile_batch(tile_list, workers, max_conn, start_time,
-                    phase_label, no_data_water=False, idle_timeout_s=None):
+                    phase_label, no_data_water=False, idle_timeout_s=None,
+                    skip_ocean=True):
     import sys as _sys
     if idle_timeout_s is None:
         idle_timeout_s = DEFAULT_BATCH_IDLE_TIMEOUT_S
@@ -502,7 +631,7 @@ def _run_tile_batch(tile_list, workers, max_conn, start_time,
     pool = ProcessPoolExecutor(max_workers=workers)
     try:
         future_to_tile = {
-            pool.submit(_bake_tile_worker, la, lo, False, max_conn, True, no_data_water): (la, lo)
+            pool.submit(_bake_tile_worker, la, lo, False, max_conn, skip_ocean, no_data_water): (la, lo)
             for la, lo in tile_list
         }
         if idle_timeout_s <= 0:
@@ -550,7 +679,7 @@ def _run_tile_batch(tile_list, workers, max_conn, start_time,
 
 def bake_region(lat_min, lat_max, lon_min, lon_max, offline=False,
                 workers=16, max_conn=120, split=None, skip_existing=True,
-                idle_timeout_s=None):
+                idle_timeout_s=None, skip_ocean=True, no_data_water=False):
     lat_lo, lat_hi = sorted((float(lat_min), float(lat_max)))
     lon_lo, lon_hi = sorted((float(lon_min), float(lon_max)))
     # Convert bbox to half-open integer tile ranges and clamp to global grid:
@@ -599,7 +728,9 @@ def bake_region(lat_min, lat_max, lon_min, lon_max, offline=False,
                 existing.add(key)
         tiles = [t for t in tiles if t not in existing]
         logger.info(f"[REGION] Skip existing: {before} -> {len(tiles)} ({before - len(tiles)} done)")
-    _run_tile_batch(tiles, workers, max_conn, time.time(), "REGION", idle_timeout_s=idle_timeout_s)
+    _run_tile_batch(tiles, workers, max_conn, time.time(), "REGION",
+                    no_data_water=no_data_water, idle_timeout_s=idle_timeout_s,
+                    skip_ocean=skip_ocean)
 
 
 def bake_global(offline=False, workers=16, max_conn=120, split=None,
@@ -632,7 +763,7 @@ def bake_global(offline=False, workers=16, max_conn=120, split=None,
         tiles = [t for t in tiles if t not in existing]
         logger.info(f"[GLOBAL] Skip existing: {before} -> {len(tiles)} ({before - len(tiles)} done)")
     _run_tile_batch(tiles, workers, max_conn, time.time(), "GLOBAL", no_data_water,
-                    idle_timeout_s=idle_timeout_s)
+                    idle_timeout_s=idle_timeout_s, skip_ocean=skip_ocean)
 
 
 def retry_errors(workers=16, max_conn=120, idle_timeout_s=None):
@@ -653,7 +784,191 @@ def retry_errors(workers=16, max_conn=120, idle_timeout_s=None):
         logger.info("[RETRY] No error tiles")
         return
     logger.info(f"[RETRY] Retrying {len(errors)} tiles")
-    _run_tile_batch(errors, workers, max_conn, time.time(), "RETRY", idle_timeout_s=idle_timeout_s)
+    _run_tile_batch(errors, workers, max_conn, time.time(), "RETRY",
+                    idle_timeout_s=idle_timeout_s)
+
+
+def _load_lonlat_file(path):
+    p = Path(path)
+    tiles = []
+    with p.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.replace("\t", ",").replace(" ", ",").split(",") if p.strip()]
+            if len(parts) < 2:
+                continue
+            try:
+                lon, lat = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            tiles.append((lat, lon))
+    return tiles
+
+
+def rebake_from_lonlat_file(path, workers=16, max_conn=120, idle_timeout_s=None,
+                            direct=False, start=0, limit=0, sleep_s=0.0,
+                            manifest_path=None, skip_ocean=True,
+                            no_data_water=False):
+    """Re-bake tiles listed as lon,lat per line (same as geo_inspect validate --failed-list)."""
+    p = Path(path)
+    if not p.is_file():
+        logger.error(f"[REBAKE-LIST] File not found: {path}")
+        return
+    tiles = _load_lonlat_file(p)
+    if start > 0:
+        tiles = tiles[int(start):]
+    if limit > 0:
+        tiles = tiles[:int(limit)]
+    if not tiles:
+        logger.info("[REBAKE-LIST] No coordinates in file")
+        return
+    logger.info(f"[REBAKE-LIST] {len(tiles)} tiles from {path}")
+    if direct:
+        return direct_rebake_tiles(
+            tiles,
+            workers=workers,
+            max_conn=max_conn,
+            sleep_s=sleep_s,
+            manifest_path=manifest_path,
+            skip_ocean=skip_ocean,
+            no_data_water=no_data_water,
+        )
+    return _run_tile_batch(tiles, workers, max_conn, time.time(), "REBAKE-LIST",
+                           no_data_water=no_data_water,
+                           idle_timeout_s=idle_timeout_s,
+                           skip_ocean=skip_ocean)
+
+
+def direct_rebake_tiles(tile_list, workers=1, max_conn=32, sleep_s=0.0,
+                        manifest_path=None, skip_ocean=True, no_data_water=False):
+    """Threaded, per-tile rebake for long recoverable runs with jsonl progress."""
+    total = len(tile_list)
+    workers = max(1, int(workers))
+    stats = {'ok': 0, 'water': 0, 'ocean': 0, 'no_data': 0, 'no_land': 0, 'error': 0}
+    done = 0
+    node_sum = 0.0
+    dl_sum = 0.0
+    qt_sum = 0.0
+    last_progress_done = -1
+    t0 = time.time()
+    manifest_f = None
+    if manifest_path:
+        mp = Path(manifest_path)
+        mp.parent.mkdir(parents=True, exist_ok=True)
+        manifest_f = mp.open("a", encoding="utf-8")
+
+    def _record(row):
+        if manifest_f:
+            manifest_f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            manifest_f.flush()
+
+    def _run_one(idx, lat, lon):
+        one_t0 = time.time()
+        try:
+            r = bake_tile(
+                lat,
+                lon,
+                offline=False,
+                max_conn=max_conn,
+                skip_ocean=skip_ocean,
+                no_data_water=no_data_water,
+            )
+            status = r.get("status", "error")
+            detail = r.get("detail", "")
+        except Exception as e:
+            status = "error"
+            detail = str(e)
+            r = {}
+        return {
+            "idx": idx,
+            "lat": lat,
+            "lon": lon,
+            "status": status,
+            "detail": detail,
+            "nodes": r.get("nodes", 0),
+            "timings": r.get("timings", {}),
+            "took": round(time.time() - one_t0, 3),
+        }
+
+    logger.info("[REBAKE-LIST] total=%d conn=%d workers=%d", total, max_conn, workers)
+
+    def _progress_line(force=False):
+        nonlocal last_progress_done
+        elapsed = time.time() - t0
+        rate = done / max(elapsed, 0.1)
+        eta_sec = (total - done) / max(rate, 0.01)
+        pct = (done / max(total, 1)) * 100.0
+        bar_len = 30
+        filled = int(bar_len * done / max(total, 1))
+        bar = "#" * filled + "-" * (bar_len - filled)
+        avg_nodes = node_sum / max(stats.get("ok", 0), 1)
+        avg_dl = dl_sum / max(done, 1)
+        avg_qt = qt_sum / max(stats.get("ok", 0), 1)
+        eta_min = int(eta_sec // 60)
+        eta_rem = int(eta_sec % 60)
+        msg = (
+            f"[REBAKE-LIST] [{bar}] {pct:.1f}% ({done}/{total}) "
+            f"land={stats.get('ok',0)} water={stats.get('water',0)} ocean={stats.get('ocean',0)} "
+            f"err={stats.get('error',0)} avg_nodes={avg_nodes:.0f} avg_dl={avg_dl:.1f}s "
+            f"avg_qt={avg_qt:.1f}s {rate:.2f}T/s ETA:{eta_min}m{eta_rem:02d}s"
+        )
+        should_log = force or done % 5 == 0 or done == total
+        if should_log and (force or done != last_progress_done):
+            logger.info(msg)
+            last_progress_done = done
+    try:
+        if workers == 1:
+            for idx, (lat, lon) in enumerate(tile_list, start=1):
+                row = _run_one(idx, lat, lon)
+                done += 1
+                stats[row["status"]] = stats.get(row["status"], 0) + 1
+                t = row.get("timings", {})
+                dl_sum += float(t.get("download", 0.0))
+                qt_sum += float(t.get("quadtree", 0.0))
+                if row["status"] == "ok":
+                    node_sum += float(row.get("nodes", 0))
+                _record(row)
+                logger.info(
+                    "[REBAKE-LIST] %d/%d %s_%s status=%s took=%.1fs detail=%s",
+                    idx, total, lon, lat, row["status"], row["took"], row["detail"]
+                )
+                _progress_line()
+                if sleep_s > 0:
+                    time.sleep(float(sleep_s))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [
+                    pool.submit(_run_one, idx, lat, lon)
+                    for idx, (lat, lon) in enumerate(tile_list, start=1)
+                ]
+                for fut in as_completed(futs):
+                    row = fut.result()
+                    done += 1
+                    stats[row["status"]] = stats.get(row["status"], 0) + 1
+                    t = row.get("timings", {})
+                    dl_sum += float(t.get("download", 0.0))
+                    qt_sum += float(t.get("quadtree", 0.0))
+                    if row["status"] == "ok":
+                        node_sum += float(row.get("nodes", 0))
+                    _record(row)
+                    logger.info(
+                        "[REBAKE-LIST] %d/%d %s_%s status=%s took=%.1fs detail=%s",
+                        done, total, row["lon"], row["lat"], row["status"], row["took"], row["detail"]
+                    )
+                    _progress_line()
+    finally:
+        if manifest_f:
+            manifest_f.close()
+
+    logger.info(
+        "[REBAKE-LIST] done total=%d ok=%d water=%d ocean=%d no_data=%d no_land=%d error=%d elapsed=%.1fs",
+        total, stats.get("ok", 0), stats.get("water", 0), stats.get("ocean", 0),
+        stats.get("no_data", 0), stats.get("no_land", 0), stats.get("error", 0),
+        time.time() - t0,
+    )
+    return stats
 
 
 # ── Anomaly Detection & Fix ───────────────────────────────────────
@@ -694,6 +1009,20 @@ def _scan_problem_tiles(pop_threshold=10.0, grid_size=3, min_hits=2):
         except Exception:
             continue
     return problems
+
+
+def write_problem_tile_list(output_path, pop_threshold=10.0, grid_size=3,
+                            min_hits=2, limit=0):
+    tiles = _scan_problem_tiles(pop_threshold, grid_size, min_hits)
+    if limit and limit > 0:
+        tiles = tiles[:int(limit)]
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as f:
+        for lat, lon in tiles:
+            f.write(f"{lon},{lat}\n")
+    logger.info("[SCAN] Wrote %d problem tiles to %s", len(tiles), out)
+    return tiles
 
 
 def fix_population_zone_batch(pop_threshold=10.0, workers=8, max_conn=60,

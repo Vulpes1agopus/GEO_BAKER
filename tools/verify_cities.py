@@ -13,10 +13,11 @@ import sys
 import os
 import json
 import argparse
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from geo_baker_pkg.core import ZONE_WATER, URBAN_NONE, URBAN_COMMERCIAL
+from geo_baker_pkg.core import TILE_DIR, ZONE_WATER, URBAN_NONE, URBAN_COMMERCIAL
 from geo_baker_pkg.io import query_elevation, query_population
 
 
@@ -28,7 +29,17 @@ def load_cities(path):
         return json.load(f)
 
 
-def verify_city(city):
+def _sample_offsets(sample_grid=1, radius_deg=0.02):
+    g = max(1, int(sample_grid))
+    if g == 1:
+        return [(0.0, 0.0)]
+    vals = np.linspace(-float(radius_deg), float(radius_deg), g)
+    out = [(0.0, 0.0)]
+    out.extend((float(dla), float(dlo)) for dla in vals for dlo in vals if dla or dlo)
+    return out
+
+
+def verify_city(city, sample_grid=1, sample_radius=0.02):
     lat = city.get('la', 0)
     lon = city.get('lo', 0)
     name = city.get('n', city.get('name', '?'))
@@ -37,13 +48,28 @@ def verify_city(city):
     if lat == 0 and lon == 0:
         return None
 
-    elev_result = query_elevation(lat, lon)
-    pop_result = query_population(lat, lon)
+    li, lo = int(np.floor(lat)), int(np.floor(lon))
+    tile_q = os.path.join(TILE_DIR, f"{lo}_{li}.qtree")
+    if not os.path.exists(tile_q):
+        return {'name': name, 'lat': lat, 'lon': lon, 'pop': pop,
+                'status': 'missing_tile', 'zone': -1, 'elev': -1,
+                'pop_density': 0, 'issue': '无瓦片文件(需烘焙该格)'}
+
+    samples = []
+    for dla, dlo in _sample_offsets(sample_grid, sample_radius):
+        sla, slo = lat + dla, lon + dlo
+        elev_result = query_elevation(sla, slo)
+        pop_result = query_population(sla, slo)
+        samples.append((dla, dlo, elev_result, pop_result))
+
+    center = samples[0]
+    elev_result = center[2]
+    pop_result = center[3]
 
     if elev_result is None:
         return {'name': name, 'lat': lat, 'lon': lon, 'pop': pop,
                 'status': 'no_data', 'zone': -1, 'elev': -1,
-                'pop_density': 0, 'issue': '无海拔数据'}
+                'pop_density': 0, 'issue': '无海拔数据(瓦片损坏/旧格式/查询失败)'}
 
     zone = elev_result.get('zone', -1)
     elev = elev_result.get('elevation', -1)
@@ -51,26 +77,40 @@ def verify_city(city):
 
     is_water = zone == ZONE_WATER
     has_pop = pop_density > 50 or pop > 10000
+    bad_samples = 0
+    water_samples = 0
+    valid_samples = 0
+    max_pop_density = pop_density
+    for idx, (_, _, er, pr) in enumerate(samples):
+        if er is None:
+            continue
+        valid_samples += 1
+        pd = pr.get('pop_density', 0) if pr else 0
+        max_pop_density = max(max_pop_density, pd)
+        if er.get('zone') == ZONE_WATER:
+            water_samples += 1
+            if pd > 50 or (idx == 0 and pop > 10000):
+                bad_samples += 1
 
-    if is_water and has_pop:
+    if (is_water and has_pop) or bad_samples > 0:
         return {
             'name': name, 'lat': lat, 'lon': lon, 'pop': pop,
             'status': 'bad', 'zone': zone, 'elev': elev,
-            'pop_density': pop_density,
-            'issue': f'水域但人口密度{pop_density}/km² (zone={zone})'
+            'pop_density': max_pop_density,
+            'issue': f'水域但人口密度{max_pop_density}/km² (water_samples={water_samples}/{valid_samples})'
         }
-    elif is_water:
+    elif is_water or water_samples > 0:
         return {
             'name': name, 'lat': lat, 'lon': lon, 'pop': pop,
             'status': 'warning', 'zone': zone, 'elev': elev,
-            'pop_density': pop_density,
-            'issue': f'水域但人口较少{pop_density}/km²'
+            'pop_density': max_pop_density,
+            'issue': f'采样含水域但人口较少{max_pop_density}/km² (water_samples={water_samples}/{valid_samples})'
         }
     else:
         return {
             'name': name, 'lat': lat, 'lon': lon, 'pop': pop,
             'status': 'ok', 'zone': zone, 'elev': elev,
-            'pop_density': pop_density,
+            'pop_density': max_pop_density,
             'issue': None
         }
 
@@ -84,6 +124,10 @@ def main():
                        metavar=('LON_MIN', 'LAT_MIN', 'LON_MAX', 'LAT_MAX'),
                        help='bbox过滤 (e.g., 100 20 150 60)')
     parser.add_argument('--min-pop', type=float, default=50000, help='最小人口阈值')
+    parser.add_argument('--sample-grid', type=int, default=1,
+                        help='城市周边采样网格边长(1=只查城市点; 3=中心+周边8点)')
+    parser.add_argument('--sample-radius', type=float, default=0.02,
+                        help='城市周边采样半径(经纬度)')
     args = parser.parse_args()
 
     cities = load_cities(args.cities)
@@ -106,12 +150,13 @@ def main():
 
     results = []
     for i, city in enumerate(cities):
-        r = verify_city(city)
+        r = verify_city(city, sample_grid=args.sample_grid, sample_radius=args.sample_radius)
         if r is None:
             continue
         results.append(r)
         if not args.problem_only or r['status'] != 'ok':
-            status_icon = {'ok': '✅', 'warning': '⚠️', 'bad': '❌', 'no_data': '❓'}.get(r['status'], '?')
+            status_icon = {'ok': '✅', 'warning': '⚠️', 'bad': '❌', 'no_data': '❓',
+                           'missing_tile': '📭'}.get(r['status'], '?')
             issue = r['issue'] or ''
             if args.problem_only and r['status'] == 'ok':
                 continue
@@ -122,9 +167,11 @@ def main():
     warn_count = sum(1 for r in results if r['status'] == 'warning')
     bad_count = sum(1 for r in results if r['status'] == 'bad')
     no_data_count = sum(1 for r in results if r['status'] == 'no_data')
+    miss_count = sum(1 for r in results if r['status'] == 'missing_tile')
 
     print(f"\n  {'='*70}")
-    print(f"  统计: ✅ OK={ok_count}  ⚠️ 警告={warn_count}  ❌ 问题={bad_count}  ❓无数据={no_data_count}")
+    print(f"  统计: ✅ OK={ok_count}  ⚠️ 警告={warn_count}  ❌ 问题={bad_count}  "
+          f"❓无数据={no_data_count}  📭缺瓦片={miss_count}")
     print(f"  总计: {len(results)} / {len(cities)} 个城市已验证")
 
     if bad_count > 0:
@@ -133,7 +180,9 @@ def main():
     elif warn_count > 0:
         print(f"\n  ⚠️  有 {warn_count} 个城市存在警告（水域+低人口）")
     else:
-        print(f"\n  ✅ 所有城市数据正常!")
+        print(f"\n  ✅ 无严重水陆冲突（水域+高人口）")
+    if miss_count > 0:
+        print(f"  📭 有 {miss_count} 个城市所在格尚未烘焙 `.qtree`，可运行 `python -m geo_baker_pkg --global` 或按区域烘焙。")
 
 
 if __name__ == '__main__':

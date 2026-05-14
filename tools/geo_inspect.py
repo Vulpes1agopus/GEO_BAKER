@@ -8,7 +8,7 @@ Usage / 用法:
     python tools/inspect.py --tile-info 116 39               # Tile details / 瓦片详情
     python tools/inspect.py --stats                           # Global stats / 全局统计
     python tools/inspect.py --validate                       # Validate all tiles / 验证所有瓦片
-    python tools/inspect.py --validate --fix-ocean           # Fix ocean tiles / 修复海洋瓦片
+    python tools/inspect.py --validate --fix-ocean           # 仅当 ESA 陆地索引足够时才写水；加 --fix-ocean-force 强制
     python tools/inspect.py --size-report                    # Size analysis / 大小分析
 """
 import os
@@ -25,9 +25,10 @@ from geo_baker_pkg.core import (
     ZONE_NAMES, URBAN_NAMES, GRADIENT_NAMES,
     ZONE_WATER, MAX_PACK_SIZE_MB,
     decode_node_16, decode_pop_leaf_node, decode_elevation,
+    verify_tile, write_water_tile,
 )
 from geo_baker_pkg.io import query_elevation, query_elevation_pack, query_population, query_population_pack
-from geo_baker_pkg.pipeline import is_likely_ocean
+from geo_baker_pkg.pipeline import is_likely_ocean, land_index_sufficient, MIN_LAND_INDEX_TILES_TRUST
 
 
 def cmd_query(args):
@@ -159,17 +160,22 @@ def cmd_validate(args):
         if size > 1:
             try:
                 with open(qf, 'rb') as f:
-                    data = f.read()
+                    raw = f.read()
+                if len(raw) >= 16 and raw[:4] == b'QTR5':
+                    data = raw[16:]
+                else:
+                    data = raw
                 if len(data) % 2 != 0:
                     errors.append((lat, lon, f"odd byte count / 奇数字节数: {len(data)}"))
-                root = decode_node_16(data[:2])
+                    continue
+                if len(data) < 2:
+                    errors.append((lat, lon, "empty node payload / 空载荷"))
+                    continue
+                root = decode_node_16(data[0:2])
                 if root.get('is_leaf', True):
                     errors.append((lat, lon, "root is leaf / 根节点是叶节点"))
-                else:
-                    subtree_size = root.get('subtree_size', 0)
-                    expected_nodes = len(data) // 2
-                    if subtree_size > expected_nodes:
-                        errors.append((lat, lon, f"subtree_size {subtree_size} > nodes {expected_nodes}"))
+                elif not verify_tile(data, decode_node_16):
+                    errors.append((lat, lon, "verify_tile failed / QTR5 结构或导航失败"))
             except Exception as e:
                 errors.append((lat, lon, f"decode error / 解码错误: {e}"))
 
@@ -184,21 +190,39 @@ def cmd_validate(args):
         for lat, lon, msg in errors[:20]:
             print(f"    ({lat},{lon}): {msg}")
 
+    fl = getattr(args, "failed_list", None)
+    if fl and errors:
+        outp = Path(fl)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        with open(outp, "w", encoding="utf-8") as fp:
+            for tile_lat, tile_lon, _msg in errors:
+                fp.write(f"{tile_lon},{tile_lat}\n")
+        print(f"\n  Wrote {len(errors)} lines to {outp} (lon,lat per line for --tile)")
+
     if ocean_mismatches and args.fix_ocean:
-        print(f"\n  Fixing ocean mismatches / 修复海洋不匹配...")
-        from geo_baker_pkg.encoding import encode_water_tile
-        for lat, lon, msg in ocean_mismatches:
-            if "water tile on land" in msg:
-                print(f"    Skipping ({lat},{lon}): {msg}")
-            elif "data tile in ocean" in msg:
-                tile_path = tile_dir / f"{lon}_{lat}.qtree"
-                pop_path = tile_dir / f"{lon}_{lat}.pop"
-                with open(tile_path, 'wb') as f:
-                    f.write(encode_water_tile())
-                if pop_path.exists():
-                    with open(pop_path, 'wb') as f:
-                        f.write(encode_water_tile())
-                print(f"    Fixed ({lat},{lon}): replaced with water tile / 替换为水域瓦片")
+        force = getattr(args, "fix_ocean_force", False)
+        if not force and not land_index_sufficient():
+            from geo_baker_pkg import pipeline as _pl
+            _pl._land_tile_cache = None
+            nland = len(_pl._build_land_tile_set())
+            print(
+                f"\n  [fix-ocean] Skipping water writes: ESA land index has {nland} tiles "
+                f"(need >= {MIN_LAND_INDEX_TILES_TRUST}).\n"
+                f"  Sparse index + blind write_water_tile caused NH wipe in 2026-05; "
+                f"use --fix-ocean-force only if you accept the risk / 勿盲写：用 --fix-ocean-force 才强制写水。"
+            )
+        else:
+            print(f"\n  Fixing ocean mismatches / 修复海洋不匹配...")
+            for lat, lon, msg in ocean_mismatches:
+                if "water tile on land" in msg:
+                    print(f"    Skipping ({lat},{lon}): {msg}")
+                elif "data tile in ocean" in msg:
+                    tile_path = tile_dir / f"{lon}_{lat}.qtree"
+                    pop_path = tile_dir / f"{lon}_{lat}.pop"
+                    write_water_tile(str(tile_path))
+                    if pop_path.exists():
+                        write_water_tile(str(pop_path))
+                    print(f"    Fixed ({lat},{lon}): replaced with water tile / 替换为水域瓦片")
 
 
 def cmd_size_report(args):
@@ -267,6 +291,10 @@ def main():
 
     v = sub.add_parser("validate", help="Validate tiles / 验证瓦片")
     v.add_argument("--fix-ocean", action="store_true", help="Fix ocean mismatches / 修复海洋不匹配")
+    v.add_argument("--fix-ocean-force", action="store_true",
+                   help="Allow write_water_tile even if ESA land index is sparse / 索引稀疏仍强制写水")
+    v.add_argument("--failed-list", type=str, default=None,
+                   help="Write lon,lat lines for failed data tiles / 将失败格写入文件供重烘")
 
     sub.add_parser("size-report", help="Size analysis / 大小分析")
 

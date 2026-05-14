@@ -5,6 +5,7 @@ GeoPack格式: zstd压缩, 360×180网格索引, O(1)随机访问
 瓦片查询: 从独立瓦片文件或.dat包查询
 """
 
+import json
 import os
 import struct
 import logging
@@ -23,6 +24,13 @@ from .core import (
 )
 
 logger = logging.getLogger('geo_baker')
+
+_SHARD_MAGIC = b"GSH1"
+_SHARD_VERSION = 1
+_SHARD_KIND_TERRAIN = 1
+_SHARD_KIND_POP = 2
+_SHARD_HEADER = struct.Struct("<4sHHhhHHIIIII")
+_SHARD_INDEX_ENTRY_SIZE = 8
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -85,6 +93,138 @@ def pack_tiles(output_path="terrain.dat"):
 
 def pack_population(output_path="population.dat"):
     _pack_tiles_inner(output_path, _POP_MAGIC, "*.pop")
+
+
+def _parse_tile_name(path):
+    parts = path.stem.split('_')
+    if len(parts) != 2:
+        return None
+    try:
+        lon, lat = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (-180 <= lon < 180 and -90 <= lat < 90):
+        return None
+    return lat, lon
+
+
+def _shard_origin(lat, lon, shard_degrees):
+    size = max(1, int(shard_degrees))
+    lon_min = -180 + ((lon + 180) // size) * size
+    lat_min = -90 + ((lat + 90) // size) * size
+    return int(lat_min), int(lon_min)
+
+
+def _shard_local_index(lat, lon, lat_min, lon_min, tile_w):
+    return (lat - lat_min) * tile_w + (lon - lon_min)
+
+
+def _pack_shards_inner(output_dir, glob_pattern, prefix, kind, shard_degrees=10):
+    tile_dir = Path(TILE_DIR)
+    if not tile_dir.exists():
+        logger.error("[SHARD-PACK] 无瓦片目录")
+        return []
+    size = max(1, int(shard_degrees))
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tile_files = []
+    for tf in sorted(tile_dir.glob(glob_pattern)):
+        key = _parse_tile_name(tf)
+        if key is None:
+            continue
+        tile_files.append((key[0], key[1], tf))
+    if not tile_files:
+        logger.warning("[SHARD-PACK] 未找到 %s 文件", glob_pattern)
+        return []
+
+    zstd_cctx = None
+    try:
+        import zstandard as zstd
+        zstd_cctx = zstd.ZstdCompressor(level=9, threads=-1)
+    except ImportError:
+        logger.warning("[SHARD-PACK] zstandard 不可用，shard 将不压缩")
+
+    groups = {}
+    for lat, lon, tf in tile_files:
+        groups.setdefault(_shard_origin(lat, lon, size), []).append((lat, lon, tf))
+
+    entries = []
+    for (lat_min, lon_min), files in sorted(groups.items()):
+        tile_w = min(size, 180 - lon_min)
+        tile_h = min(size, 90 - lat_min)
+        index = bytearray(tile_w * tile_h * _SHARD_INDEX_ENTRY_SIZE)
+        data = bytearray()
+        raw_size = 0
+        count = 0
+        for lat, lon, tf in files:
+            blob = tf.read_bytes()
+            raw_size += len(blob)
+            if zstd_cctx is not None:
+                blob = zstd_cctx.compress(blob)
+            local_idx = _shard_local_index(lat, lon, lat_min, lon_min, tile_w)
+            if local_idx < 0 or local_idx >= tile_w * tile_h:
+                continue
+            if len(data) > 0xFFFFFFFF or len(blob) > 0xFFFFFFFF:
+                raise ValueError("Shard offsets exceed 32-bit range; reduce shard size")
+            struct.pack_into("<II", index, local_idx * _SHARD_INDEX_ENTRY_SIZE, len(data), len(blob))
+            data.extend(blob)
+            count += 1
+        flags = 1 if zstd_cctx is not None else 0
+        name = f"{prefix}_{lon_min:+04d}_{lat_min:+03d}.gsh"
+        path = out_dir / name
+        header = _SHARD_HEADER.pack(
+            _SHARD_MAGIC, _SHARD_VERSION, kind, lon_min, lat_min, tile_w, tile_h,
+            count, len(index), len(data), raw_size, flags,
+        )
+        with path.open("wb") as f:
+            f.write(header)
+            f.write(index)
+            f.write(data)
+        entries.append({
+            "path": name,
+            "kind": "terrain" if kind == _SHARD_KIND_TERRAIN else "population",
+            "lon_min": lon_min,
+            "lat_min": lat_min,
+            "tile_w": tile_w,
+            "tile_h": tile_h,
+            "tile_count": count,
+            "index_bytes": len(index),
+            "data_bytes": len(data),
+            "raw_bytes": raw_size,
+            "file_bytes": path.stat().st_size,
+        })
+    return entries
+
+
+def pack_shards(output_dir="shards", shard_degrees=10, include_population=True):
+    """Pack tiles into small geographic shards for lazy game-side loading."""
+    entries = []
+    entries.extend(_pack_shards_inner(output_dir, "*.qtree", "terrain", _SHARD_KIND_TERRAIN, shard_degrees))
+    if include_population:
+        entries.extend(_pack_shards_inner(output_dir, "*.pop", "population", _SHARD_KIND_POP, shard_degrees))
+    manifest = {
+        "format": "GeoShard",
+        "version": _SHARD_VERSION,
+        "shard_degrees": max(1, int(shard_degrees)),
+        "header_bytes": _SHARD_HEADER.size,
+        "index_entry_bytes": _SHARD_INDEX_ENTRY_SIZE,
+        "compression": "zstd-per-tile" if entries and any(e["data_bytes"] < e["raw_bytes"] for e in entries) else "none",
+        "global_grid": {"lon_min": -180, "lat_min": -90, "width": 360, "height": 180},
+        "shards": entries,
+    }
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_dir / "manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+    total_bytes = sum(e["file_bytes"] for e in entries)
+    logger.info(
+        "[SHARD-PACK] %d shards, %.2f MB total → %s",
+        len(entries),
+        total_bytes / 1024 / 1024,
+        manifest_path,
+    )
+    return manifest
 
 
 def incremental_pack(output_path="terrain.dat", max_size_mb=MAX_PACK_SIZE_MB):
@@ -212,6 +352,8 @@ class GeoPackReader:
             return None
         if len(blob) <= 1:
             return {'is_leaf': True, 'elevation': 0, 'gradient_level': 0, 'zone': ZONE_WATER}
+        if len(blob) >= 16 and blob[:4] == b'QTR5':
+            blob = blob[16:]
         return navigate_qtr5(blob, lat - lat_int, lon - lon_int)
 
     def query_population(self, lat, lon):
@@ -221,6 +363,8 @@ class GeoPackReader:
             return None
         if len(blob) <= 1:
             return {'is_leaf': True, 'pop_density': 0, 'urban_zone': 0}
+        if len(blob) >= 16 and blob[:4] == b'QTR5':
+            blob = blob[16:]
         return navigate_qtr5_pop(blob, lat - lat_int, lon - lon_int)
 
     def close(self):

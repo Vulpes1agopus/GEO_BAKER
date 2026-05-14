@@ -4,13 +4,13 @@ Build a global airport dataset (IATA/ICAO) and plot China airports.
 
 Data source:
 - OpenFlights airports.dat (airport metadata)
-- OpenFlights routes.dat (route edges used as a traffic proxy)
+- OpenFlights routes.dat (route edges used as a traffic estimate)
 
 Outputs:
 - airports/global_airports_iata_icao.csv
 - airports/global_airports_iata_icao.jsonl.gz
 - airports/china_airports_iata_icao.csv
-- images/china_airports_route_proxy.png
+- images/china_airports_route_estimate.png
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ ROUTES_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build global IATA/ICAO airport dataset and plot China airports")
     parser.add_argument("--out-dir", type=str, default="airports", help="Directory for airport data outputs")
-    parser.add_argument("--img-path", type=str, default="images/china_airports_route_proxy.png", help="Output image path")
-    parser.add_argument("--global-img-path", type=str, default="images/global_airports_route_proxy.png", help="Global output image path")
+    parser.add_argument("--img-path", type=str, default="images/china_airports_route_estimate.png", help="Output image path")
+    parser.add_argument("--global-img-path", type=str, default="images/global_airports_route_estimate.png", help="Global output image path")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP request timeout seconds")
     parser.add_argument("--top-labels", type=int, default=20, help="Label top-N China airports by route_count")
     parser.add_argument(
@@ -253,7 +253,7 @@ def plot_china_airports(rows: List[Dict[str, object]], out_path: Path, top_label
     fig, ax = plt.subplots(figsize=(11, 8))
     sc = ax.scatter(xs, ys, s=sizes, c=colors, cmap="viridis", alpha=0.85, edgecolors="black", linewidths=0.3)
     cbar = fig.colorbar(sc, ax=ax, shrink=0.82)
-    cbar.set_label(f"{metric} (route-derived proxy)")
+    cbar.set_label(f"{metric} (route-derived estimate)")
 
     top = sorted(china_rows, key=lambda r: int(r[metric]), reverse=True)[: max(0, top_labels)]
     for r in top:
@@ -287,7 +287,7 @@ def plot_global_airports(rows: List[Dict[str, object]], out_path: Path, top_labe
     fig, ax = plt.subplots(figsize=(14, 7))
     sc = ax.scatter(xs, ys, s=sizes, c=colors, cmap="viridis", alpha=0.75, edgecolors="none")
     cbar = fig.colorbar(sc, ax=ax, shrink=0.82)
-    cbar.set_label(f"{metric} (route-derived proxy)")
+    cbar.set_label(f"{metric} (route-derived estimate)")
 
     top = sorted(rows, key=lambda r: int(r[metric]), reverse=True)[: max(0, top_labels)]
     for r in top:

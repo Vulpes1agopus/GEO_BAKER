@@ -11,11 +11,20 @@ venv/
 *.pyc
 *.pyo
 
-# Runtime data — tiles 入 Git；*.dat 不入库（仅本地）
+# Runtime/generated data. Keep public repos code-first; publish data packs separately.
 *.dat
+*.gpk
+*.qtree
+*.pop
+tiles/
 cache/
 logs/
 *.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.eps
 data/*.pkl
 data/*.gpk
 data/*.npy
@@ -23,6 +32,7 @@ data/*.tif
 data/*.tiff
 data/*.gz
 data/*.zip
+data/land_tiles.json
 interop/*.json
 interop/*.hpp
 interop/*.dart
@@ -30,6 +40,18 @@ interop/*.svg
 images/
 airports/*.gz
 airports/*.csv
+backups/
+archive/
+
+# Local configuration and secrets
+.env
+.env.*
+config.yaml
+secrets.*
+*.pem
+*.key
+id_*
+!*.pub
 
 # OS
 .DS_Store
@@ -46,7 +68,9 @@ Thumbs.db
 # Large binary files
 *.tar
 *.tar.gz
+*.tar.zst
 *.zip
+*.zst
 
 # Temporary
 *.tmp

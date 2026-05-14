@@ -15,11 +15,12 @@ import argparse
 
 from .core import TILE_DIR, LOG_FILE
 from .pipeline import (
-    bake_tile, bake_region, bake_global, retry_errors, _parse_split_arg,
+    bake_tile, bake_region, bake_global, retry_errors, rebake_from_lonlat_file,
+    _parse_split_arg,
     is_likely_ocean, configure_runtime_tuning, fix_coastal_batch,
-    fix_population_zone_batch,
+    fix_population_zone_batch, write_problem_tile_list,
 )
-from .io import pack_tiles, pack_population, merge_gpk, incremental_pack
+from .io import pack_tiles, pack_population, merge_gpk, incremental_pack, pack_shards
 from .io import query_elevation, query_elevation_pack, query_population, query_population_pack
 
 
@@ -65,7 +66,8 @@ def main():
         help='烘焙区域: lon_min lat_min lon_max lat_max (上界不含; 自动夹到 lon[-180,180),lat[-90,90))'
     )
     parser.add_argument('--global', action='store_true', dest='bake_global', help='烘焙全球')
-    parser.add_argument('--bake-ocean', action='store_true', help='(已弃用，默认行为)全球烘焙时不跳过海洋瓦片')
+    parser.add_argument('--bake-ocean', action='store_true',
+                        help='不使用 land-index 快速跳过海洋，强制进入完整下载/判定流程')
     parser.add_argument('--no-data-water', action='store_true', help='NO_DATA瓦片直接写水瓦片(不下载zone判断)')
     parser.add_argument('--offline', action='store_true', help='离线模式(仅缓存)')
     parser.add_argument('--dry-run', action='store_true', dest='dry_run', help='仅计算索引')
@@ -86,11 +88,31 @@ def main():
     parser.add_argument('--pack-output', type=str, default='terrain.dat', help='打包输出路径')
     parser.add_argument('--pack-pop', action='store_true', help='打包人口瓦片')
     parser.add_argument('--pack-pop-output', type=str, default='population.dat', help='人口打包输出')
+    parser.add_argument('--pack-shards', action='store_true',
+                        help='按经纬度分片打包，适合游戏按区域懒加载')
+    parser.add_argument('--pack-shards-output', type=str, default='shards',
+                        help='分片打包输出目录')
+    parser.add_argument('--shard-degrees', type=int, default=10,
+                        help='分片大小(度)，默认10表示10x10个1度瓦片')
+    parser.add_argument('--no-pack-shards-pop', action='store_true',
+                        help='分片打包时只打地形，不打人口')
     parser.add_argument('--incremental-pack', action='store_true', help='增量打包')
     parser.add_argument('--merge', type=str, nargs=2, default=None, metavar=('FILE1', 'FILE2'), help='合并.dat文件')
     parser.add_argument('--merge-output', type=str, default='merged.dat', help='合并输出')
     parser.add_argument('--split', type=str, default=None, help='分布式烘焙: N/M')
     parser.add_argument('--retry-errors', action='store_true', help='重试错误瓦片')
+    parser.add_argument('--rebake-list', type=str, default=None,
+                        help='按文件重烘: 每行 lon,lat（与 validate --failed-list 一致）')
+    parser.add_argument('--direct-rebake', action='store_true',
+                        help='--rebake-list 使用线程直跑模式，逐瓦片记录进度，适合长任务/screen')
+    parser.add_argument('--rebake-start', type=int, default=0,
+                        help='--direct-rebake 起始下标(0基)')
+    parser.add_argument('--rebake-limit', type=int, default=0,
+                        help='--direct-rebake 限制处理数量(0=全部)')
+    parser.add_argument('--rebake-sleep', type=float, default=0.0,
+                        help='--direct-rebake 单线程时每格间隔秒数')
+    parser.add_argument('--rebake-manifest', type=str, default=None,
+                        help='--direct-rebake JSONL进度输出路径')
     parser.add_argument('--fix-coastal', action='store_true', help='检测并重新烘焙沿海问题瓦片')
     parser.add_argument('--fix-pop-zone', action='store_true', help='自动检测并重烘焙人口/城镇与zone冲突瓦片(含小城市乡镇)')
     parser.add_argument('--cities-json', type=str, default='data/global_cities.json', help='城市列表JSON路径')
@@ -99,6 +121,10 @@ def main():
     parser.add_argument('--scan-grid', type=int, default=3, help='每瓦片采样网格边长(3表示9点)')
     parser.add_argument('--scan-min-hits', type=int, default=1, help='判定异常最小命中点数')
     parser.add_argument('--scan-max-tiles', type=int, default=2000, help='每轮最多重烘焙瓦片数')
+    parser.add_argument('--scan-problems-output', type=str, default=None,
+                        help='只扫描人口/zone异常并输出 lon,lat 列表，不重烘')
+    parser.add_argument('--scan-problems-limit', type=int, default=0,
+                        help='--scan-problems-output 输出数量限制(0=全部)')
 
     args = parser.parse_args()
 
@@ -112,7 +138,8 @@ def main():
 
     setup_logging(console_level=logging.DEBUG if args.verbose else logging.INFO, verbose=args.verbose)
 
-    if args.tile or args.bbox or args.bake_global or args.retry_errors:
+    if (args.tile or args.bbox or args.bake_global or args.retry_errors or
+            args.rebake_list or args.scan_problems_output):
         configure_runtime_tuning(max_conn=args.conn, workers=args.workers)
 
     start = time.time()
@@ -183,6 +210,15 @@ def main():
         print(f"\n  耗时: {time.time() - start:.1f}s")
         return
 
+    if args.pack_shards:
+        pack_shards(
+            output_dir=args.pack_shards_output,
+            shard_degrees=args.shard_degrees,
+            include_population=not args.no_pack_shards_pop,
+        )
+        print(f"\n  耗时: {time.time() - start:.1f}s")
+        return
+
     if args.incremental_pack:
         incremental_pack(args.pack_output)
         print(f"\n  耗时: {time.time() - start:.1f}s")
@@ -196,8 +232,32 @@ def main():
         print(f"\n  耗时: {time.time() - start:.1f}s")
         return
 
+    if args.scan_problems_output:
+        write_problem_tile_list(
+            args.scan_problems_output,
+            pop_threshold=args.pop_threshold,
+            grid_size=args.scan_grid,
+            min_hits=args.scan_min_hits,
+            limit=args.scan_problems_limit,
+        )
+        print(f"\n  耗时: {time.time() - start:.1f}s")
+        return
+
     if args.retry_errors:
         retry_errors(workers=args.workers, max_conn=args.conn, idle_timeout_s=args.tile_timeout)
+        print(f"\n  耗时: {time.time() - start:.1f}s")
+        return
+
+    if args.rebake_list:
+        rebake_from_lonlat_file(args.rebake_list, workers=args.workers, max_conn=args.conn,
+                                idle_timeout_s=args.tile_timeout,
+                                direct=args.direct_rebake,
+                                start=args.rebake_start,
+                                limit=args.rebake_limit,
+                                sleep_s=args.rebake_sleep,
+                                manifest_path=args.rebake_manifest,
+                                skip_ocean=not args.bake_ocean,
+                                no_data_water=args.no_data_water)
         print(f"\n  耗时: {time.time() - start:.1f}s")
         return
 
@@ -238,14 +298,16 @@ def main():
         bake_region(args.bbox[1], args.bbox[3], args.bbox[0], args.bbox[2],
                     offline=args.offline, workers=args.workers, max_conn=args.conn, split=split,
                     skip_existing=not args.no_skip_existing,
-                    idle_timeout_s=args.tile_timeout)
+                    idle_timeout_s=args.tile_timeout,
+                    skip_ocean=not args.bake_ocean,
+                    no_data_water=args.no_data_water)
     elif args.bake_global:
         bake_global(
             offline=args.offline,
             workers=args.workers,
             max_conn=args.conn,
             split=split,
-            skip_ocean=False,
+            skip_ocean=not args.bake_ocean,
             no_data_water=args.no_data_water,
             idle_timeout_s=args.tile_timeout,
         )
@@ -291,9 +353,13 @@ def _print_usage():
     print("    python -m geo_baker_pkg --global --max-conn 80     # --max-conn 为 --conn 兼容别名")
     print("    python -m geo_baker_pkg --pack                     # 打包地形")
     print("    python -m geo_baker_pkg --pack-pop                 # 打包人口")
+    print("    python -m geo_baker_pkg --pack-shards              # 游戏友好分片打包")
     print("    python -m geo_baker_pkg --incremental-pack         # 增量打包")
     print("    python -m geo_baker_pkg --merge a.dat b.dat        # 合并")
     print("    python -m geo_baker_pkg --retry-errors             # 重试错误")
+    print("    python -m geo_baker_pkg --rebake-list path.txt     # 按 validate --failed-list 重烘")
+    print("    python -m geo_baker_pkg --rebake-list path.txt --direct-rebake --workers 4")
+    print("    python -m geo_baker_pkg --scan-problems-output logs/problems.list")
     print("    python -m geo_baker_pkg --fix-coastal             # 修复沿海问题瓦片")
     print("    python -m geo_baker_pkg --fix-pop-zone            # 修复有人口但zone异常的瓦片")
     print("    python -m geo_baker_pkg --query 39.9 116.4         # 查询")

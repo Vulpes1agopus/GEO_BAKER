@@ -50,8 +50,9 @@ GRADIENT_COLORS = ["#2ecc71", "#f1c40f", "#e67e22", "#e74c3c"]
 GRADIENT_CMAP = ListedColormap(GRADIENT_COLORS)
 GRADIENT_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], GRADIENT_CMAP.N)
 
-URBAN_COLORS = ["#1a1a2e", "#e94560", "#0f3460", "#533483", "#16213e", "#2b2d42", "#8d99ae", "#8d99ae"]
+URBAN_COLORS = ["#111111", "#ffd60a", "#00bbf9", "#fb5607", "#8338ec", "#80ed99", "#ef476f", "#adb5bd"]
 URBAN_CMAP = ListedColormap(URBAN_COLORS)
+URBAN_CMAP.set_bad("#ff00ff")
 URBAN_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5], URBAN_CMAP.N)
 URBAN_LABELS = ["None", "Residential", "Commercial", "Industrial", "Mixed", "Institutional", "Reserved", "Reserved"]
 
@@ -289,30 +290,75 @@ def cmd_quad_overview(args):
     print(f"Saved: {args.output} ({w}x{h})")
 
 def cmd_compare(args):
-    """Compare elevation + population at a point / 对比某点的海拔与人口"""
+    """Compare urban zone + terrain zone + elevation + population at a point / 对比城镇区+地形区+海拔+人口"""
     lat, lon = args.lat, args.lon
+    span = max(0.05, float(args.span))
+    bbox = (lat - span, lon - span, lat + span, lon + span)
+    resolution = max(40, int(args.resolution))
 
-    result = query_elevation(lat, lon)
-    pop_result = query_population(lat, lon)
+    if args.tile_dir:
+        os.environ["GEO_BAKER_TILE_DIR"] = str(Path(args.tile_dir).resolve())
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    _, _, urban_grid = _sample_grid(
+        bbox,
+        resolution,
+        lambda qlat, qlon: (query_population(qlat, qlon) or {}).get('urban_zone', np.nan),
+    )
+    _, _, zone_grid = _sample_zone_grid(bbox, resolution)
+    _, _, elev_grid = _sample_elevation_grid(bbox, resolution)
+    _, _, pop_grid = _sample_population_grid(bbox, resolution)
 
-    for ax, data_fn, title, cmap_label in [
-        (axes[0], _sample_elevation_grid, "Elevation / 海拔", "m"),
-        (axes[1], _sample_population_grid, "Population / 人口", "/km²"),
-    ]:
-        bbox = (lat - 0.5, lon - 0.5, lat + 0.5, lon + 0.5)
-        _, _, grid = data_fn(bbox, 100)
-        im = ax.imshow(grid, origin="lower", extent=bbox[:2] + bbox[2:],
-                       cmap=ELEVATION_CMAP if "Elev" in title else POPULATION_CMAP,
-                       interpolation="nearest", aspect="auto")
-        ax.set_title(title)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    extent = [bbox[1], bbox[3], bbox[0], bbox[2]]
+
+    im0 = axes[0, 0].imshow(
+        urban_grid, origin="lower", extent=extent,
+        cmap=URBAN_CMAP, norm=URBAN_NORM, interpolation="nearest", aspect="auto"
+    )
+    # Add class-boundary contour to avoid "blank-looking" large-city panels.
+    if np.any(np.isfinite(urban_grid)):
+        u = np.nan_to_num(urban_grid, nan=-1)
+        axes[0, 0].contour(
+            u,
+            levels=[0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
+            colors="white",
+            linewidths=0.25,
+            origin="lower",
+            extent=extent,
+        )
+    axes[0, 0].set_title("Urban Zone / 城镇区")
+    cbar0 = fig.colorbar(im0, ax=axes[0, 0], ticks=list(range(8)), shrink=0.82)
+    cbar0.ax.set_yticklabels(["No Urban", "Residential", "Commercial", "Industrial", "Mixed", "Institutional", "Reserved", "Reserved"])
+
+    im1 = axes[0, 1].imshow(
+        zone_grid, origin="lower", extent=extent,
+        cmap=ZONE_CMAP, norm=ZONE_NORM, interpolation="nearest", aspect="auto"
+    )
+    axes[0, 1].set_title("Terrain Zone / 自然区")
+    cbar1 = fig.colorbar(im1, ax=axes[0, 1], ticks=[0, 1, 2, 3], shrink=0.82)
+    cbar1.ax.set_yticklabels(["Water", "Natural", "Forest", "Harsh"])
+
+    im2 = axes[1, 0].imshow(
+        elev_grid, origin="lower", extent=extent,
+        cmap=ELEVATION_CMAP, interpolation="nearest", aspect="auto"
+    )
+    axes[1, 0].set_title("Elevation / 海拔")
+    fig.colorbar(im2, ax=axes[1, 0], label="m", shrink=0.82)
+
+    vmax = float(np.nanpercentile(pop_grid, 99)) if np.any(~np.isnan(pop_grid)) else 1.0
+    im3 = axes[1, 1].imshow(
+        pop_grid, origin="lower", extent=extent,
+        cmap=POPULATION_CMAP, vmin=0, vmax=max(vmax, 1), interpolation="nearest", aspect="auto"
+    )
+    axes[1, 1].set_title("Population Density / 人口密度")
+    fig.colorbar(im3, ax=axes[1, 1], label="/km²", shrink=0.82)
+
+    for ax in axes.flat:
         ax.set_xlabel("Longitude / 经度")
         ax.set_ylabel("Latitude / 纬度")
-        fig.colorbar(im, ax=ax, label=cmap_label, shrink=0.8)
-        ax.plot(lon, lat, "r*", markersize=15)
+        ax.plot(lon, lat, "r*", markersize=12)
 
-    fig.suptitle(f"Point Comparison / 点对比: ({lat}N, {lon}E)")
+    fig.suptitle(f"Point 4-Panel Comparison / 四联图: ({lat}N, {lon}E), span=±{span}°")
     fig.tight_layout()
     fig.savefig(args.output, dpi=args.dpi)
     plt.close(fig)
@@ -349,9 +395,17 @@ def main():
     q.add_argument("-o", "--output", type=str, default="global_quad_overview.png", help="Output path")
     q.add_argument("--dpi", type=int, default=140, help="Output DPI")
 
-    c = sub.add_parser("compare", help="Compare elevation+pop at point / 对比海拔+人口")
+    c = sub.add_parser("compare", help="Compare 4 panels at point / 四联图对比")
     c.add_argument("--lat", type=float, required=True, help="Latitude / 纬度")
     c.add_argument("--lon", type=float, required=True, help="Longitude / 经度")
+    c.add_argument("--resolution", type=int, default=140, help="Grid resolution / 网格分辨率")
+    c.add_argument("--span", type=float, default=0.25, help="Half-span in degrees around point / 采样半径(度)")
+    c.add_argument(
+        "--tile-dir",
+        type=str,
+        default=str(Path(__file__).resolve().parent.parent / "tiles"),
+        help="Tile directory path / 瓦片目录路径",
+    )
     c.add_argument("-o", "--output", type=str, default="compare.png", help="Output path / 输出路径")
     c.add_argument("--dpi", type=int, default=140, help="Output DPI / 输出DPI")
 

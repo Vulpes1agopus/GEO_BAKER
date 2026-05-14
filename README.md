@@ -2,10 +2,6 @@
 
 将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR5 格式），用于游戏、仿真和离线地理查询。
 
-**文档**：见 [docs/README.md](docs/README.md)（[总览](docs/overview.md) · [技术参考](docs/technical_reference.md)）。
-
-> 公开仓库只保存源码、文档、小型元数据和测试。`tiles/`、`terrain.dat`、`population.dat`、日志、缓存、预览图和备份包都是本地生成物，不纳入 Git。
-
 ## 特性
 
 - **多源数据融合**：DEM (30m) + 人口 (1km) + 地表类型 (100m)，默认使用公开数据源，无需项目私有凭据。
@@ -136,15 +132,9 @@ GeoBaker/
 │   ├── visualize.py
 │   ├── verify_cities.py
 │   └── bake_background.sh
-├── scripts/                     # 可选数据准备和渲染脚本
-│   ├── borders/
-│   ├── interop_export/
-│   ├── visualization/
-│   ├── verify.py
-│   └── quad_view.py
+├── scripts/visualization/       # 可选可视化辅助脚本
 ├── tests/                       # 单元测试
-├── data/                        # 小型元数据，如城市验证列表
-└── docs/                        # 架构和格式说明
+└── data/                        # 小型元数据，如城市验证列表
 ```
 
 ## 架构
@@ -160,6 +150,28 @@ GeoBaker/
 - **非线性海拔**：0-511m @ 1m 精度，512-1535m @ 2m，1536-3583m @ 4m，3584-8190m @ 8m。
 - **人口编码**：12bit 对数编码，覆盖低密度乡村到高密度城市。
 - **DFS 前序遍历**：通过 `subtree_size` 跳过子树，点查询复杂度约为 `O(depth)`。
+
+### 瓦片坐标
+
+每个瓦片覆盖一个整数经纬度单元：
+
+```text
+tile lon = floor(longitude)
+tile lat = floor(latitude)
+terrain filename = tiles/{lon}_{lat}.qtree
+population filename = tiles/{lon}_{lat}.pop
+```
+
+瓦片内部坐标归一化到 `[0, 1)`。四叉树象限顺序固定为：
+
+```text
+0 = NW
+1 = NE
+2 = SW
+3 = SE
+```
+
+构建和读取必须保持相同象限顺序。
 
 ### 数据管线
 
@@ -207,6 +219,12 @@ WorldPop ArcGIS ────────┤──→ 下载 ─→ 对齐 ─→
 - **水域瓦片**：1 字节 (`0xFF`)
 - **数据瓦片**：2 x N 字节，16bit 节点数组，DFS 前序
 
+### 精度说明
+
+- 海拔采用非线性米级桶，优先保留低海拔和常见地形精度。
+- 人口采用对数密度编码，避免城市高密度区域被压扁。
+- terrain zone 是分类语义层，不应当当作精确边界；游戏逻辑里更建议以海拔、坡度和人口为主判据，zone 作为辅助提示。
+
 ## 许可证
 
 MIT License，详见 [LICENSE](LICENSE)。
@@ -216,10 +234,6 @@ MIT License，详见 [LICENSE](LICENSE)。
 # GeoBaker (English)
 
 GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR5 format) for games, simulations, and offline geospatial queries.
-
-**Docs**: see [docs/README.md](docs/README.md), [overview](docs/overview.md), and [technical reference](docs/technical_reference.md).
-
-> The public repository is source-first. `tiles/`, `terrain.dat`, `population.dat`, logs, caches, preview images, and backups are generated locally and are not committed.
 
 ## Features
 
@@ -351,15 +365,9 @@ GeoBaker/
 │   ├── visualize.py
 │   ├── verify_cities.py
 │   └── bake_background.sh
-├── scripts/                     # Optional data-preparation and rendering scripts
-│   ├── borders/
-│   ├── interop_export/
-│   ├── visualization/
-│   ├── verify.py
-│   └── quad_view.py
+├── scripts/visualization/       # Optional visualization helper scripts
 ├── tests/                       # Unit tests
-├── data/                        # Small metadata files, such as city validation lists
-└── docs/                        # Architecture and format notes
+└── data/                        # Small metadata files, such as city validation lists
 ```
 
 ## Architecture
@@ -375,6 +383,28 @@ Branch node:     [1bit is_leaf=0][15bit subtree_size]
 - **Nonlinear elevation**: compact meter buckets for low and high terrain.
 - **Population encoding**: logarithmic 12-bit density encoding.
 - **DFS pre-order traversal**: navigate by skipping subtrees with `subtree_size`.
+
+### Tile Coordinates
+
+Each tile covers one integer-degree cell:
+
+```text
+tile lon = floor(longitude)
+tile lat = floor(latitude)
+terrain filename = tiles/{lon}_{lat}.qtree
+population filename = tiles/{lon}_{lat}.pop
+```
+
+Coordinates inside a tile are normalized to `[0, 1)`. Quadrant order is fixed:
+
+```text
+0 = NW
+1 = NE
+2 = SW
+3 = SE
+```
+
+The builder and reader must use the same quadrant order.
 
 ### Data Pipeline
 
@@ -424,6 +454,13 @@ population as supporting evidence:
 
 - **Water tile**: 1 byte (`0xFF`)
 - **Data tile**: 2 x N bytes, 16-bit node array in DFS pre-order
+
+### Precision Notes
+
+- Elevation uses nonlinear meter buckets to preserve useful terrain precision.
+- Population uses logarithmic density buckets to preserve dense urban contrast.
+- Terrain zone is a coarse categorical layer. For gameplay, prefer elevation,
+  gradient, and population as primary signals, and use zone as an auxiliary hint.
 
 ## License
 

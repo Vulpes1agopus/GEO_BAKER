@@ -8,7 +8,7 @@
 - Added a concise public README and documentation index.
 - Synced the current package, tool, script, and test layout from the active
   development workspace.
-- Documented QTR5 and GeoPack formats in `docs/technical_reference.md`.
+- Documented QTR5 and GeoPack formats in the bilingual `README.md`.
 
 ## 1.0.0
 

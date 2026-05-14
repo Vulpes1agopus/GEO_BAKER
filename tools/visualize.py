@@ -33,6 +33,8 @@ from geo_baker_pkg.core import (
     navigate_qtr5, navigate_qtr5_pop,
 )
 from geo_baker_pkg.io import query_elevation, query_population
+import geo_baker_pkg.core as gb_core
+import geo_baker_pkg.io as gb_io
 
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -199,7 +201,7 @@ def cmd_quad_overview(args):
         print(f"  Population pack not found: {pop_path}")
         return
 
-    spt = 8
+    spt = max(2, int(args.samples_per_tile))
     h = 180 * spt
     w = 360 * spt
     step = 1.0 / spt
@@ -251,7 +253,7 @@ def cmd_quad_overview(args):
 
     print()
 
-    fig, axes = plt.subplots(2, 2, figsize=(48, 24))
+    fig, axes = plt.subplots(2, 2, figsize=(56, 28))
     extent = [-180, 180, -90, 90]
 
     im0 = axes[0, 0].imshow(elev_grid, origin="lower", extent=extent,
@@ -297,7 +299,10 @@ def cmd_compare(args):
     resolution = max(40, int(args.resolution))
 
     if args.tile_dir:
-        os.environ["GEO_BAKER_TILE_DIR"] = str(Path(args.tile_dir).resolve())
+        tile_dir = str(Path(args.tile_dir).resolve())
+        os.environ["GEO_BAKER_TILE_DIR"] = tile_dir
+        gb_core.TILE_DIR = tile_dir
+        gb_io.TILE_DIR = tile_dir
 
     _, _, urban_grid = _sample_grid(
         bbox,
@@ -392,6 +397,7 @@ def main():
     q = sub.add_parser("quad-overview", help="Global 4-panel overview / 全球四合一概览")
     q.add_argument("--terrain-pack", type=str, default="terrain.dat", help="Terrain .dat path")
     q.add_argument("--pop-pack", type=str, default="population.dat", help="Population .dat path")
+    q.add_argument("--samples-per-tile", type=int, default=8, help="Samples per 1° tile edge / 每度瓦片每边采样点数")
     q.add_argument("-o", "--output", type=str, default="global_quad_overview.png", help="Output path")
     q.add_argument("--dpi", type=int, default=140, help="Output DPI")
 

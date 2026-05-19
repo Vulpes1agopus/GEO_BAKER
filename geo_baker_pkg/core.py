@@ -23,7 +23,7 @@ ZONE_WATER, ZONE_NATURAL, ZONE_FOREST, ZONE_HARSH = 0, 1, 2, 3
 ZONE_NAMES = {0: "Water", 1: "Natural", 2: "Forest", 3: "Harsh"}
 ZONE_BUILD_COST = {0: 99.0, 1: 1.0, 2: 1.5, 3: 6.0}
 ESA_TO_ZONE = {
-    0: 1, 10: 2, 20: 1, 30: 1, 40: 1, 50: 1, 60: 1,
+    0: 0, 10: 2, 20: 1, 30: 1, 40: 1, 50: 1, 60: 1,
     70: 3, 80: 0, 90: 3, 95: 3, 100: 1,
 }
 
@@ -39,6 +39,7 @@ URBAN_NAMES = {
 }
 URBAN_BUILD_COST = {0: 1.0, 1: 1.2, 2: 3.0, 3: 2.0, 4: 2.5, 5: 2.0, 6: 1.0, 7: 1.0}
 ESA_URBAN_CLASS = 50
+ESA_WATER_CLASS = 80
 
 _POP_LOG_SCALE = 355.7
 _POP_LOG_MAX = 4095
@@ -54,7 +55,7 @@ TARGET_SIZE = 1024
 _TERRAIN_VAR = 1.0
 _TERRAIN_MAX_ABS_ERROR = 4.0
 _WATER_MIX_VAR = 5.0
-_ZONE_MIX_MINORITY = 0.02
+_ZONE_MIX_MINORITY = 0.005
 _COASTAL_POP_PX = 10.0
 _POP_VAR = 16.0
 _POP_HOTSPOT_DELTA = 25.0
@@ -289,12 +290,11 @@ def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
 
     def _leaf(arrs, nodes):
         d, z, p, gi = arrs[0], arrs[1], arrs[2], arrs[3]
-        me = d.mean()
         zv = int(np.argmax(np.bincount(z.ravel().astype(int))))
-        if me > 0 and zv == ZONE_WATER:
-            zv = ZONE_NATURAL
-        elif zv == ZONE_WATER and p is not None and np.any(p > _COASTAL_POP_PX):
-            zv = ZONE_NATURAL
+        # Zone cleanup has already happened before tree building.  Do not infer
+        # land from positive elevation here: high-altitude lakes and rivers are
+        # still water, and DEM can be positive over inland water surfaces.
+        me = 0.0 if zv == ZONE_WATER else float(d.mean())
         nodes.append(encode_leaf_node_16(me, zv, _grad_level_from_img(gi)))
 
     arrays = [dem, zone, pop_arr, grad_img]

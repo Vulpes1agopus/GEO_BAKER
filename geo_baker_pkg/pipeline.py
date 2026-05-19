@@ -8,6 +8,7 @@ Coastal fix: population as ground truth for water/land correction.
 """
 
 import json
+import math
 import os
 import time
 import logging
@@ -25,7 +26,7 @@ from concurrent.futures import (
 from .core import (
     TILE_DIR, STAC_PC, STAC_E84,
     OPEN_ELEVATION_URL, WORLDPOP_ARCGIS_URL,
-    ZONE_WATER, ZONE_NATURAL, ESA_TO_ZONE, ESA_URBAN_CLASS,
+    ZONE_WATER, ZONE_NATURAL, ESA_TO_ZONE, ESA_URBAN_CLASS, ESA_WATER_CLASS,
     _POP_NOISE_FLOOR, TARGET_SIZE, MAX_NODES, WATER_BYTE,
     build_adaptive_tree, build_adaptive_pop_tree,
     navigate_qtr5, navigate_qtr5_pop,
@@ -200,25 +201,58 @@ def _fetch_raster(url, bbox, band=1):
     return None
 
 
-def _fetch_stac_raster(stac_url, collection, bbox, asset_keys=("data", "DEM")):
+def _raster_nonzero_fraction(data):
+    if data is None:
+        return 0.0
+    a = np.asarray(data)
+    if a.size == 0:
+        return 0.0
+    finite = np.isfinite(a)
+    if not np.any(finite):
+        return 0.0
+    return float(np.count_nonzero(np.abs(a[finite]) > 1e-6) / max(int(np.count_nonzero(finite)), 1))
+
+
+def _inset_bbox(bbox, eps=0.001):
+    left, bottom, right, top = bbox
+    if right - left <= eps * 2 or top - bottom <= eps * 2:
+        return bbox
+    return [left + eps, bottom + eps, right - eps, top - eps]
+
+
+def _fetch_stac_raster(stac_url, collection, bbox, asset_keys=("data", "DEM"),
+                       min_nonzero_fraction=0.0, search_bbox=None):
     """Unified STAC raster fetcher for DEM and ESA."""
     try:
         cat = _open_stac(stac_url)
-        items = list(cat.search(collections=[collection], bbox=bbox, max_items=10).items())
+        items = list(cat.search(collections=[collection], bbox=search_bbox or bbox, max_items=10).items())
         if not items: return None
         try:
             import shapely.geometry as sg
             target = sg.box(*bbox)
-            best = max(items, key=lambda it: target.intersection(
-                sg.box(*it.bbox)).area if it.bbox and len(it.bbox) >= 4 else 0)
+            items = sorted(items, key=lambda it: target.intersection(
+                sg.box(*it.bbox)).area if it.bbox and len(it.bbox) >= 4 else 0, reverse=True)
         except ImportError:
-            best = items[0]
-        for key in asset_keys:
-            asset = best.assets.get(key)
-            if asset and asset.href:
-                data = _fetch_raster(asset.href, bbox)
-                if data is not None:
-                    return data
+            pass
+        best_data = None
+        best_fraction = -1.0
+        for item in items:
+            for key in asset_keys:
+                asset = item.assets.get(key)
+                if asset and asset.href:
+                    data = _fetch_raster(asset.href, bbox)
+                    if data is None:
+                        continue
+                    if min_nonzero_fraction <= 0:
+                        return data
+                    frac = _raster_nonzero_fraction(data)
+                    if frac >= min_nonzero_fraction:
+                        return data
+                    if frac > best_fraction:
+                        best_fraction = frac
+                        best_data = data
+        if min_nonzero_fraction <= 0:
+            return best_data
     except Exception:
         pass
     return None
@@ -272,18 +306,117 @@ def _is_empty(data):
     return a.size == 0 or (float(np.nanmax(a)) == 0.0 and float(np.nanmin(a)) == 0.0)
 
 
+_terrarium_session = None
+_terrarium_tile_cache = {}
+
+
+def _get_terrarium_session():
+    global _terrarium_session
+    if _terrarium_session is None:
+        import requests
+        _terrarium_session = requests.Session()
+        _terrarium_session.headers.update({
+            'User-Agent': 'GeoBaker/1.0',
+            'Connection': 'keep-alive',
+        })
+    return _terrarium_session
+
+
+def _terrarium_tile_xy(lon, lat, zoom):
+    lat = max(min(float(lat), 85.05112878), -85.05112878)
+    n = 2 ** zoom
+    x = int((float(lon) + 180.0) / 360.0 * n)
+    lat_rad = math.radians(lat)
+    y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return max(0, min(n - 1, x)), max(0, min(n - 1, y))
+
+
+def _terrarium_pixel_xy(lon, lat, zoom):
+    lat = max(min(float(lat), 85.05112878), -85.05112878)
+    n = 2 ** zoom
+    x = (float(lon) + 180.0) / 360.0 * n * 256.0
+    lat_rad = math.radians(lat)
+    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n * 256.0
+    return x, y
+
+
+def _fetch_terrarium_tile(zoom, x, y):
+    key = (zoom, x, y)
+    cached = _terrarium_tile_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from PIL import Image
+        from io import BytesIO
+        url = f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{zoom}/{x}/{y}.png"
+        resp = _get_terrarium_session().get(url, timeout=30)
+        if resp.status_code != 200 or len(resp.content) < 100:
+            return None
+        arr = np.asarray(Image.open(BytesIO(resp.content)).convert('RGB'), dtype=np.float32)
+        elev = arr[:, :, 0] * 256.0 + arr[:, :, 1] + arr[:, :, 2] / 256.0 - 32768.0
+        if len(_terrarium_tile_cache) > 256:
+            _terrarium_tile_cache.clear()
+        _terrarium_tile_cache[key] = elev
+        return elev
+    except Exception:
+        return None
+
+
+def _download_terrarium_dem(lat, lon, zoom=10, target_size=512):
+    """Fallback DEM from Mapzen/Terrarium XYZ tiles. Includes bathymetry (<0)."""
+    try:
+        lats = lat + (np.arange(target_size, dtype=np.float32) + 0.5) / target_size
+        lons = lon + (np.arange(target_size, dtype=np.float32) + 0.5) / target_size
+        corners = [(lon, lat), (lon + 1, lat), (lon, lat + 1), (lon + 1, lat + 1)]
+        xs, ys = zip(*[_terrarium_tile_xy(lo, la, zoom) for lo, la in corners])
+        for tx in range(min(xs), max(xs) + 1):
+            for ty in range(min(ys), max(ys) + 1):
+                _fetch_terrarium_tile(zoom, tx, ty)
+        out = np.zeros((target_size, target_size), dtype=np.float32)
+        ok = np.zeros((target_size, target_size), dtype=bool)
+        for i, la in enumerate(lats):
+            for j, lo in enumerate(lons):
+                px, py = _terrarium_pixel_xy(float(lo), float(la), zoom)
+                tx, ty = int(px // 256), int(py // 256)
+                tile = _fetch_terrarium_tile(zoom, tx, ty)
+                if tile is None:
+                    continue
+                ix = max(0, min(255, int(px - tx * 256)))
+                iy = max(0, min(255, int(py - ty * 256)))
+                out[i, j] = tile[iy, ix]
+                ok[i, j] = True
+        if not np.any(ok):
+            return None
+        if np.count_nonzero(ok) < ok.size:
+            out[~ok] = 0
+        return out
+    except Exception:
+        return None
+
+
 def _download_dem(lat, lon, max_conn=200):
     bbox = [lon, lat, lon + 1, lat + 1]
+    search_bbox = _inset_bbox(bbox)
     for url, col in _ranked_dem_sources():
         try:
-            dem = _fetch_stac_raster(url, col, bbox)
+            dem = _fetch_stac_raster(url, col, bbox, min_nonzero_fraction=0.01,
+                                     search_bbox=search_bbox)
             if not _is_empty(dem): return dem
         except Exception:
             continue
     try:
-        return _download_open_elevation(lat, lon, max_conn)
+        dem = _download_terrarium_dem(lat, lon)
+        if dem is not None and dem.size:
+            return dem
     except Exception:
-        return None
+        pass
+    try:
+        dem = _download_open_elevation(lat, lon, max_conn)
+        if not _is_empty(dem):
+            return dem
+    except Exception:
+        pass
+    return None
 
 
 _pop_session = None
@@ -321,11 +454,12 @@ def _download_pop(lat, lon):
 def _download_esa(lat, lon):
     bbox = [lon, lat, lon + 1, lat + 1]
     try:
-        data = _fetch_stac_raster(STAC_PC, "esa-worldcover", bbox, asset_keys=("data", "map"))
-        if not _is_empty(data): return data
+        data = _fetch_stac_raster(STAC_PC, "esa-worldcover", bbox,
+                                  asset_keys=("data", "map"),
+                                  search_bbox=_inset_bbox(bbox))
+        return None if data is None else data.astype(np.uint8)
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _concurrent_download(lat, lon, max_conn=200):
@@ -348,18 +482,27 @@ def _concurrent_download(lat, lon, max_conn=200):
 
 # ── Data Processing ────────────────────────────────────────────────
 
-def _build_zone_grid(esa_data):
+def _build_zone_layers(esa_data):
     if esa_data is not None:
-        zone = np.full_like(esa_data, ZONE_NATURAL, dtype=np.uint8)
+        # ESA class 80 is explicit surface water.  Class 0 is ocean/no-coverage in
+        # many COGs, so it starts as water but is not protected from later land fixes.
+        zone = np.full_like(esa_data, ZONE_WATER, dtype=np.uint8)
         for cls, zv in ESA_TO_ZONE.items():
             zone[esa_data == cls] = zv
         urban = (esa_data == ESA_URBAN_CLASS).astype(np.uint8)
-        return zone, urban
+        explicit_water = (esa_data == ESA_WATER_CLASS)
+        return zone, urban, explicit_water.astype(np.uint8)
     return (np.full((TARGET_SIZE, TARGET_SIZE), ZONE_NATURAL, dtype=np.uint8),
+            np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=np.uint8),
             np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=np.uint8))
 
 
-def align_tile_data(dem, pop, zone, urban=None, target_size=TARGET_SIZE):
+def _build_zone_grid(esa_data):
+    zone, urban, _ = _build_zone_layers(esa_data)
+    return zone, urban
+
+
+def align_tile_data(dem, pop, zone, urban=None, explicit_water=None, target_size=TARGET_SIZE):
     import scipy.ndimage
 
     def _resize(arr, sz):
@@ -371,28 +514,88 @@ def align_tile_data(dem, pop, zone, urban=None, target_size=TARGET_SIZE):
 
     return (_resize(dem, target_size), _resize(pop, target_size),
             _resize(zone, target_size),
-            _resize(urban, target_size) if urban is not None else None)
+            _resize(urban, target_size) if urban is not None else None,
+            _resize(explicit_water, target_size).astype(bool) if explicit_water is not None else None)
 
 
-def fix_water_consistency(dem, pop, zone, urban, coastal_threshold=10.0):
-    """Three-pass water/land consistency fix using population as ground truth."""
-    if zone is None or pop is None: return
-    # Pass 1: coastal cities — pop proves habitation, override water zone
-    coast = (zone == ZONE_WATER) & (pop > coastal_threshold)
+def patch_dem_zero_holes(lat, lon, dem, zero_fraction_threshold=0.02):
+    """Patch zero-valued DEM holes with Terrarium before water/land cleanup."""
+    if dem is None:
+        return dem
+    a = np.asarray(dem)
+    if a.size == 0:
+        return dem
+    finite = np.isfinite(a)
+    if not np.any(finite):
+        return dem
+    holes = finite & (np.abs(a) <= 1e-6)
+    hole_fraction = float(np.count_nonzero(holes) / max(a.size, 1))
+    if hole_fraction < zero_fraction_threshold:
+        return dem
+    try:
+        terr = _download_terrarium_dem(lat, lon, target_size=512)
+        if terr is None or terr.size == 0:
+            return dem
+        if terr.shape != a.shape:
+            import scipy.ndimage
+            zy, zx = a.shape[0] / terr.shape[0], a.shape[1] / terr.shape[1]
+            terr = scipy.ndimage.zoom(terr, (zy, zx), order=1).astype(a.dtype)
+        patch = holes & np.isfinite(terr) & (np.abs(terr) > 1e-6)
+        if np.any(patch):
+            out = a.copy()
+            out[patch] = terr[patch]
+            logger.debug(
+                "[FIX] dem-hole patch %s_%s: holes=%.1f%% patched=%.1f%%",
+                lon, lat, hole_fraction * 100.0,
+                np.count_nonzero(patch) / max(a.size, 1) * 100.0,
+            )
+            return out
+    except Exception:
+        return dem
+    return dem
+
+
+def fix_water_consistency(dem, pop, zone, urban, explicit_water=None, coastal_threshold=10.0):
+    """Keep explicit water while correcting only inferred/no-coverage water."""
+    if zone is None or pop is None:
+        return
+    protected = np.asarray(explicit_water, dtype=bool) if explicit_water is not None else np.zeros_like(zone, dtype=bool)
+    inferred_water = (zone == ZONE_WATER) & ~protected
+
+    # Pass 1: coastal cities — population proves habitation, but never overrides
+    # ESA explicit water (lakes/rivers often inherit nearby population density).
+    coast = inferred_water & (pop > coastal_threshold)
     if np.any(coast):
         zone[coast] = ZONE_NATURAL
-        if urban is not None: urban[coast] = 0
+        if urban is not None:
+            urban[coast] = 0
         logger.debug(f"[FIX] coastal: {int(np.sum(coast))} px")
-    # Pass 2: elevation > 0 can't be water
+
+    # Pass 2: positive DEM can rescue inferred water/no-coverage, but explicit
+    # water may be high-altitude lakes/rivers and must remain water.
     if dem is not None:
-        land = (dem > 0) & (zone == ZONE_WATER)
+        inferred_water = (zone == ZONE_WATER) & ~protected
+        land = inferred_water & (dem > 0)
         if np.any(land):
             zone[land] = ZONE_NATURAL
-            logger.debug(f"[FIX] elev>0: {int(np.sum(land))} px")
-    # Pass 3: water zones must have zero pop/urban
+            logger.debug(f"[FIX] elev>0 inferred-water: {int(np.sum(land))} px")
+
+    # Pass 3: bathymetry fallback marks open water even when ESA is missing.
+    if dem is not None:
+        bathy = (dem < -5.0) & (pop <= _POP_NOISE_FLOOR)
+        if np.any(bathy):
+            zone[bathy] = ZONE_WATER
+            if urban is not None:
+                urban[bathy] = 0
+            logger.debug(f"[FIX] bathy<0: {int(np.sum(bathy))} px")
+
+    # Pass 4: water zones must have zero pop/urban/elevation in the packed game layer.
     water = zone == ZONE_WATER
+    if dem is not None:
+        dem[water] = 0
     pop[water] = 0
-    if urban is not None: urban[water] = 0
+    if urban is not None:
+        urban[water] = 0
 
 
 # ── Runtime Tuning ─────────────────────────────────────────────────
@@ -491,18 +694,16 @@ def _bake_tile_core(lat, lon, offline=False, max_conn=200,
     if skip_ocean and is_likely_ocean(lat, lon):
         esa = _download_esa(lat, lon)
         if esa is not None:
-            zg = np.full_like(esa, ZONE_NATURAL, dtype=np.uint8)
-            for c, z in ESA_TO_ZONE.items(): zg[esa == c] = z
+            zg, _ = _build_zone_grid(esa)
             if np.count_nonzero(zg == ZONE_WATER) / max(zg.size, 1) > 0.95:
                 _write_water(lat, lon)
                 return {'status': 'ocean', 'nodes': 0}
             if abs(lat) >= 80:
                 return {'status': 'no_data', 'nodes': 0}
         else:
-            if no_data_water:
-                _write_water(lat, lon)
-                return {'status': 'ocean', 'nodes': 0}
-            return {'status': 'no_data', 'nodes': 0}
+            # Land index is coarse and may miss islands/coastal land.  If ESA misses,
+            # continue into DEM/Terrarium fallback instead of writing a whole water tile.
+            pass
 
     dem, pop, esa = _concurrent_download(lat, lon, max_conn)
     dl_t = time.time() - t0
@@ -513,16 +714,27 @@ def _bake_tile_core(lat, lon, offline=False, max_conn=200,
             return {'status': 'ocean', 'nodes': 0}
         if esa is None: esa = _download_esa(lat, lon)
         if esa is not None:
-            zg = np.full_like(esa, ZONE_NATURAL, dtype=np.uint8)
-            for c, z in ESA_TO_ZONE.items(): zg[esa == c] = z
+            zg, _ = _build_zone_grid(esa)
             if np.count_nonzero(zg == ZONE_WATER) / max(zg.size, 1) > 0.95:
                 _write_water(lat, lon)
                 return {'status': 'ocean', 'nodes': 0}
         return {'status': 'no_data', 'nodes': 0}
 
-    zone, urban = _build_zone_grid(esa)
-    dem, pop, zone, urban = align_tile_data(dem, pop, zone, urban)
-    fix_water_consistency(dem, pop, zone, urban)
+    zone, urban, explicit_water = _build_zone_layers(esa)
+    aligned = align_tile_data(dem, pop, zone, urban, explicit_water)
+    if len(aligned) == 4:
+        # Compatibility for tests or external callers monkeypatching the old
+        # four-value align_tile_data signature.
+        dem, pop, zone, urban = aligned
+        explicit_water = None
+    else:
+        dem, pop, zone, urban, explicit_water = aligned
+    dem = patch_dem_zero_holes(lat, lon, dem)
+    fix_water_consistency(dem, pop, zone, urban, explicit_water)
+    if np.count_nonzero(zone == ZONE_WATER) / max(zone.size, 1) > 0.995:
+        _write_water(lat, lon)
+        return {'status': 'ocean', 'nodes': 0,
+                'timings': {'download': dl_t, 'quadtree': 0.0, 'total': time.time() - t0}}
 
     qt0 = time.time()
     result = _compute_tile(lat, lon, dem, pop, zone, urban)

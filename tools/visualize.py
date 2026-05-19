@@ -15,13 +15,14 @@ import os
 import sys
 import struct
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.colors import ListedColormap, BoundaryNorm, LinearSegmentedColormap
 from matplotlib.collections import LineCollection
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -43,7 +44,19 @@ plt.rcParams["axes.unicode_minus"] = False
 
 # ── Color Palettes / 调色板 ────────────────────────────────────────
 
-ELEVATION_CMAP = "terrain"
+WATER_COLOR = "#274b9f"
+ZERO_LAND_COLOR = "#b0005a"
+ELEVATION_LAND_CMAP = LinearSegmentedColormap.from_list(
+    "geobaker_land_elevation",
+    [
+        "#d7c58a",
+        "#8abf62",
+        "#d6cf72",
+        "#a67854",
+        "#f2f0e8",
+    ],
+    N=256,
+)
 POPULATION_CMAP = "magma"
 ZONE_COLORS = ["#1a5276", "#f9e79f", "#27ae60", "#7b241c"]
 ZONE_CMAP = ListedColormap(ZONE_COLORS)
@@ -58,6 +71,42 @@ URBAN_CMAP = ListedColormap(URBAN_COLORS)
 URBAN_CMAP.set_bad("#ff00ff")
 URBAN_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5], URBAN_CMAP.N)
 URBAN_LABELS = ["None", "Residential", "Commercial", "Industrial", "Mixed", "Institutional", "Reserved", "Reserved"]
+
+
+def _draw_elevation(ax, elev_grid, extent, zone_grid=None, interpolation="nearest", title=None):
+    """Draw elevation with explicit water and suspect zero-land colors."""
+    elev = np.asarray(elev_grid, dtype=np.float32)
+    water = np.isfinite(elev) & (elev <= 0)
+    if zone_grid is not None:
+        water = water | (np.isfinite(zone_grid) & (np.asarray(zone_grid) == ZONE_WATER))
+    suspect_zero_land = np.zeros_like(water, dtype=bool)
+
+    ax.set_facecolor(WATER_COLOR)
+    if np.any(water):
+        water_layer = np.ma.masked_where(~water, np.ones_like(elev, dtype=np.float32))
+        ax.imshow(
+            water_layer, origin="lower", extent=extent,
+            cmap=ListedColormap([WATER_COLOR]), interpolation="nearest", aspect="auto"
+        )
+
+    land = np.ma.masked_where(water | suspect_zero_land | ~np.isfinite(elev), elev)
+    finite_land = np.asarray(land.compressed(), dtype=np.float32)
+    vmax = float(np.nanpercentile(finite_land, 99.5)) if finite_land.size else 1.0
+    im = ax.imshow(
+        land, origin="lower", extent=extent,
+        cmap=ELEVATION_LAND_CMAP, vmin=0, vmax=max(vmax, 1.0),
+        interpolation=interpolation, aspect="auto"
+    )
+
+    if np.any(suspect_zero_land):
+        bad_layer = np.ma.masked_where(~suspect_zero_land, np.ones_like(elev, dtype=np.float32))
+        ax.imshow(
+            bad_layer, origin="lower", extent=extent,
+            cmap=ListedColormap([ZERO_LAND_COLOR]), interpolation="nearest", aspect="auto"
+        )
+    if title:
+        ax.set_title(title)
+    return im
 
 
 def _sample_grid(bbox, resolution, query_fn):
@@ -81,9 +130,175 @@ def _sample_elevation_grid(bbox, resolution):
     return _sample_grid(bbox, resolution, lambda lat, lon: (query_elevation(lat, lon) or {}).get('elevation', np.nan))
 
 
+def _sample_elevation_zone_grids(bbox, resolution):
+    lat_min, lon_min, lat_max, lon_max = bbox
+    lats = np.linspace(lat_min, lat_max, resolution)
+    lons = np.linspace(lon_min, lon_max, resolution)
+    elev = np.full((resolution, resolution), np.nan, dtype=np.float32)
+    zone = np.full((resolution, resolution), np.nan, dtype=np.float32)
+    for i, lat in enumerate(lats):
+        for j, lon in enumerate(lons):
+            result = query_elevation(lat, lon)
+            if result is not None:
+                elev[i, j] = result.get('elevation', np.nan)
+                zone[i, j] = result.get('zone', np.nan)
+    return lats, lons, elev, zone
+
+
 def _sample_population_grid(bbox, resolution):
     """Sample population grid / 采样人口网格"""
     return _sample_grid(bbox, resolution, lambda lat, lon: (query_population(lat, lon) or {}).get('pop_density', np.nan))
+
+
+def _sample_asset_grids(bbox, width, height):
+    """Sample all public export layers in one pass / 一次采样所有公开导出图层"""
+    lat_min, lon_min, lat_max, lon_max = bbox
+    lats = np.linspace(lat_min, lat_max, height)
+    lons = np.linspace(lon_min, lon_max, width)
+    elev = np.full((height, width), np.nan, dtype=np.float32)
+    zone = np.full((height, width), ZONE_WATER, dtype=np.uint8)
+    water = np.zeros((height, width), dtype=np.uint8)
+    pop = np.zeros((height, width), dtype=np.float32)
+    urban = np.zeros((height, width), dtype=np.uint8)
+
+    total = width * height
+    done = 0
+    report_step = max(1, total // 50)
+    for i, lat in enumerate(lats):
+        for j, lon in enumerate(lons):
+            terrain = query_elevation(lat, lon) or {}
+            population = query_population(lat, lon) or {}
+            e = terrain.get("elevation", np.nan)
+            z = int(terrain.get("zone", ZONE_WATER))
+            elev[i, j] = e
+            zone[i, j] = np.uint8(np.clip(z, 0, 3))
+            water[i, j] = 1 if z == ZONE_WATER or (np.isfinite(e) and e <= 0) else 0
+            pop[i, j] = float(population.get("pop_density", 0.0) or 0.0)
+            urban[i, j] = np.uint8(np.clip(int(population.get("urban_zone", 0) or 0), 0, 7))
+            done += 1
+            if done % report_step == 0 or done == total:
+                pct = done / total * 100.0
+                print(f"  Sampling assets: {pct:5.1f}% ({done}/{total})", end="\r")
+    print()
+    return lats, lons, elev, zone, water, pop, urban
+
+
+def _encode_gray(arr, bit_depth):
+    arr = np.clip(np.nan_to_num(arr, nan=0.0), 0.0, 1.0)
+    if bit_depth == 8:
+        return (arr * 255.0 + 0.5).astype(np.uint8), "L"
+    if bit_depth == 16:
+        return (arr * 65535.0 + 0.5).astype(np.uint16), "I;16"
+    raise ValueError("bit_depth must be 8 or 16")
+
+
+def _save_gray_png(path, normalized, bit_depth):
+    from PIL import Image
+
+    encoded, mode = _encode_gray(normalized, bit_depth)
+    Image.fromarray(encoded, mode=mode).save(path)
+
+
+def _save_index_png(path, arr):
+    from PIL import Image
+
+    Image.fromarray(np.asarray(arr, dtype=np.uint8), mode="L").save(path)
+
+
+def _format_bytes(num):
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(num)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+
+
+def cmd_export_map_assets(args):
+    """Export game-friendly raster layers / 导出游戏友好的栅格图层"""
+    bbox = tuple(args.bbox)
+    resolution = max(16, int(args.resolution))
+    width = max(16, int(args.width or resolution))
+    height = max(16, int(args.height or resolution))
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = args.prefix
+
+    _, _, elev, zone, water, pop, urban = _sample_asset_grids(bbox, width, height)
+    finite_elev = elev[np.isfinite(elev)]
+    land_elev = elev[(water == 0) & np.isfinite(elev)]
+    if args.min_elevation is not None:
+        elev_min = float(args.min_elevation)
+    elif land_elev.size:
+        elev_min = float(np.nanmin(land_elev))
+    elif finite_elev.size:
+        elev_min = float(np.nanmin(finite_elev))
+    else:
+        elev_min = 0.0
+
+    if args.max_elevation is not None:
+        elev_max = float(args.max_elevation)
+    elif land_elev.size:
+        elev_max = float(np.nanpercentile(land_elev, float(args.percentile_max)))
+    elif finite_elev.size:
+        elev_max = float(np.nanpercentile(finite_elev, float(args.percentile_max)))
+    else:
+        elev_max = 1.0
+    if elev_max <= elev_min:
+        elev_max = elev_min + 1.0
+
+    height_source = elev.copy()
+    if not args.no_water_zero:
+        height_source[water == 1] = elev_min
+    height_norm = (height_source - elev_min) / (elev_max - elev_min)
+
+    pop_nonzero = pop[np.isfinite(pop) & (pop > 0)]
+    pop_max = float(np.nanpercentile(pop_nonzero, float(args.population_percentile))) if pop_nonzero.size else 1.0
+    pop_scale_max = max(np.log1p(pop_max), 1.0)
+    pop_norm = np.log1p(np.clip(pop, 0.0, None)) / pop_scale_max
+
+    height_path = out_dir / f"{prefix}_heightmap_u{args.bit_depth}.png"
+    pop_path = out_dir / f"{prefix}_population_log_u{args.bit_depth}.png"
+    water_path = out_dir / f"{prefix}_water_mask.png"
+    zone_path = out_dir / f"{prefix}_zone_index.png"
+    urban_path = out_dir / f"{prefix}_urban_index.png"
+    metadata_path = out_dir / f"{prefix}_metadata.json"
+
+    _save_gray_png(height_path, height_norm, args.bit_depth)
+    _save_gray_png(pop_path, pop_norm, args.bit_depth)
+    _save_index_png(water_path, water * 255)
+    _save_index_png(zone_path, zone)
+    _save_index_png(urban_path, urban)
+
+    metadata = {
+        "bbox": {"south": bbox[0], "west": bbox[1], "north": bbox[2], "east": bbox[3]},
+        "resolution": {"width": width, "height": height},
+        "heightmap": {
+            "file": height_path.name,
+            "bit_depth": args.bit_depth,
+            "encoding": "linear normalized elevation",
+            "min_elevation_m": elev_min,
+            "max_elevation_m": elev_max,
+            "water_encoded_as_min": not args.no_water_zero,
+        },
+        "population": {
+            "file": pop_path.name,
+            "bit_depth": args.bit_depth,
+            "encoding": "log1p(pop_density) normalized",
+            "percentile_max": float(args.population_percentile),
+            "pop_density_max_for_scale": pop_max,
+        },
+        "water_mask": {"file": water_path.name, "values": {"0": "land", "255": "water"}},
+        "zone_index": {"file": zone_path.name, "values": {str(i): name for i, name in enumerate(ZONE_NAMES)}},
+        "urban_index": {"file": urban_path.name, "values": {str(i): name for i, name in enumerate(URBAN_NAMES)}},
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    raw_bytes = width * height * ((2 if args.bit_depth == 16 else 1) * 2 + 3)
+    print(f"Exported / 已导出: {out_dir}")
+    for path in (height_path, pop_path, water_path, zone_path, urban_path, metadata_path):
+        print(f"  {path.name}: {_format_bytes(path.stat().st_size)}")
+    print(f"Approx raw layer memory / 近似未压缩图层内存: {_format_bytes(raw_bytes)}")
 
 
 def _sample_zone_grid(bbox, resolution):
@@ -161,15 +376,17 @@ def _collect_boundary_segments(bbox, tile_dir, kind="pop", max_leaf_lines=25000)
 def cmd_elevation(args):
     """Render elevation heatmap / 渲染海拔热力图"""
     bbox = (args.south, args.west, args.north, args.east)
-    lats, lons, grid = _sample_elevation_grid(bbox, args.resolution)
+    lats, lons, grid, zone_grid = _sample_elevation_zone_grids(bbox, args.resolution)
 
     fig, ax = plt.subplots(figsize=(12, 8))
-    im = ax.imshow(grid, origin="lower", extent=[args.west, args.east, args.south, args.north],
-                   cmap=ELEVATION_CMAP, interpolation="nearest", aspect="auto")
+    im = _draw_elevation(
+        ax, grid, [args.west, args.east, args.south, args.north], zone_grid,
+        interpolation="nearest",
+        title=f"Elevation / 海拔 ({args.west}E-{args.east}E, {args.south}N-{args.north}N)",
+    )
     ax.set_xlabel("Longitude / 经度")
     ax.set_ylabel("Latitude / 纬度")
-    ax.set_title(f"Elevation / 海拔 ({args.west}E-{args.east}E, {args.south}N-{args.north}N)")
-    fig.colorbar(im, ax=ax, label="Elevation (m) / 海拔(米)", shrink=0.8)
+    fig.colorbar(im, ax=ax, label="Land elevation (m) / 陆地海拔(米)", shrink=0.8)
     fig.tight_layout()
     fig.savefig(args.output, dpi=args.dpi)
     plt.close(fig)
@@ -242,12 +459,13 @@ def cmd_overview(args):
                             grid[row, col] = node.get('elevation', 0)
 
     fig, ax = plt.subplots(figsize=(36, 18))
-    im = ax.imshow(grid, origin="lower", extent=[-180, 180, -90, 90],
-                   cmap=ELEVATION_CMAP, interpolation="nearest", aspect="auto")
+    im = _draw_elevation(
+        ax, grid, [-180, 180, -90, 90], None,
+        interpolation="nearest", title="Global Elevation Overview"
+    )
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title("Global Elevation Overview")
-    fig.colorbar(im, ax=ax, label="Elevation (m)", shrink=0.6)
+    fig.colorbar(im, ax=ax, label="Land elevation (m)", shrink=0.6)
     fig.tight_layout()
     fig.savefig(args.output, dpi=args.dpi)
     plt.close(fig)
@@ -319,10 +537,12 @@ def cmd_quad_overview(args):
     fig, axes = plt.subplots(2, 2, figsize=(56, 28))
     extent = [-180, 180, -90, 90]
 
-    im0 = axes[0, 0].imshow(elev_grid, origin="lower", extent=extent,
-                             cmap=ELEVATION_CMAP, interpolation="bilinear", aspect="auto")
-    axes[0, 0].set_title("Global Elevation", fontsize=18)
-    fig.colorbar(im0, ax=axes[0, 0], label="Elevation (m)", shrink=0.6)
+    im0 = _draw_elevation(
+        axes[0, 0], elev_grid, extent, zone_grid,
+        interpolation="nearest", title="Global Elevation"
+    )
+    axes[0, 0].title.set_fontsize(18)
+    fig.colorbar(im0, ax=axes[0, 0], label="Land elevation (m)", shrink=0.6)
 
     valid_pop = pop_grid[np.isfinite(pop_grid)]
     vmax = float(np.nanpercentile(valid_pop, 99)) if len(valid_pop) > 0 else 1.0
@@ -410,11 +630,10 @@ def cmd_compare(args):
     cbar1 = fig.colorbar(im1, ax=axes[0, 1], ticks=[0, 1, 2, 3], shrink=0.82)
     cbar1.ax.set_yticklabels(["Water", "Natural", "Forest", "Harsh"])
 
-    im2 = axes[1, 0].imshow(
-        elev_grid, origin="lower", extent=extent,
-        cmap=ELEVATION_CMAP, interpolation="nearest", aspect="auto"
+    im2 = _draw_elevation(
+        axes[1, 0], elev_grid, extent, zone_grid,
+        interpolation="nearest", title="Elevation / 海拔"
     )
-    axes[1, 0].set_title("Elevation / 海拔")
     fig.colorbar(im2, ax=axes[1, 0], label="m", shrink=0.82)
 
     vmax = float(np.nanpercentile(pop_grid, 99)) if np.any(~np.isnan(pop_grid)) else 1.0
@@ -509,6 +728,20 @@ def main():
     )
     c.add_argument("--max-leaf-lines", type=int, default=25000, help="Boundary segment cap / 边界线段上限")
 
+    a = sub.add_parser("export-map-assets", help="Export raster map assets / 导出栅格地图资产")
+    a.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("SOUTH", "WEST", "NORTH", "EAST"))
+    a.add_argument("--resolution", type=int, default=1024, help="Fallback square resolution / 默认方形输出分辨率")
+    a.add_argument("--width", type=int, default=None, help="Output width in pixels / 输出宽度像素")
+    a.add_argument("--height", type=int, default=None, help="Output height in pixels / 输出高度像素")
+    a.add_argument("-o", "--output-dir", type=str, required=True, help="Output directory / 输出目录")
+    a.add_argument("--prefix", type=str, default="geobaker", help="Output filename prefix / 输出文件名前缀")
+    a.add_argument("--bit-depth", type=int, default=16, choices=(8, 16), help="Gray image bit depth / 灰度图位深")
+    a.add_argument("--min-elevation", type=float, default=None, help="Heightmap minimum elevation / 高度图最小海拔")
+    a.add_argument("--max-elevation", type=float, default=None, help="Heightmap maximum elevation / 高度图最大海拔")
+    a.add_argument("--percentile-max", type=float, default=99.7, help="Auto height max percentile / 自动高度最大百分位")
+    a.add_argument("--population-percentile", type=float, default=99.5, help="Population log scale percentile / 人口对数缩放百分位")
+    a.add_argument("--no-water-zero", action="store_true", help="Keep raw water elevation instead of clamping to minimum / 水体不压到最低值")
+
     args = parser.parse_args()
 
     if args.command == "elevation":
@@ -526,6 +759,8 @@ def main():
         cmd_quad_overview(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "export-map-assets":
+        cmd_export_map_assets(args)
 
 
 if __name__ == "__main__":

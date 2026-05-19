@@ -32,7 +32,6 @@ data/*.tif
 data/*.tiff
 data/*.gz
 data/*.zip
-data/land_tiles.json
 interop/*.json
 interop/*.hpp
 interop/*.dart

@@ -1,11 +1,11 @@
 # GeoBaker
 
-将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR5 格式），用于游戏、仿真和离线地理查询。
+将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR5/QTR6 格式），用于游戏、仿真和离线地理查询。
 
 ## 特性
 
 - **多源数据融合**：DEM (30m) + 人口 (1km) + 地表类型 (100m)，默认使用公开数据源，无需项目私有凭据。
-- **自适应四叉树 (QTR5)**：16bit 节点、非线性海拔编码、动态节点预算。
+- **自适应四叉树 (QTR5/QTR6)**：16bit 节点、非线性海拔编码、动态节点预算。
 - **紧凑二进制格式**：支持 zstd 压缩的 GeoPack，360 x 180 网格索引，适合随机访问。
 - **水陆一致性处理**：NO_DATA 瓦片可结合 ESA WorldCover 判断水陆，避免盲写水瓦片。
 - **沿海城市修正**：用人口栅格辅助修正海岸线附近的水陆误判。
@@ -159,7 +159,7 @@ GeoBaker/
 
 ## 架构
 
-### QTR5 格式（16bit 节点）
+### QTR5/QTR6 格式（16bit 节点）
 
 ```text
 地形叶节点: [1bit is_leaf=1][11bit 海拔(非线性)][2bit 坡度][2bit 区域]
@@ -167,7 +167,7 @@ GeoBaker/
 分支节点:   [1bit is_leaf=0][15bit subtree_size]
 ```
 
-- **非线性海拔**：0-511m @ 1m 精度，512-1535m @ 2m，1536-3583m @ 4m，3584-8190m @ 8m。
+- **非线性海拔**：QTR5 为 0-8190m 无符号编码；QTR6 使用同样 11bit 字段表达约 -512m 到 8176m，保留死海、里海沿岸等负海拔陆地。
 - **人口编码**：12bit 对数编码，覆盖低密度乡村到高密度城市。
 - **DFS 前序遍历**：通过 `subtree_size` 跳过子树，点查询复杂度约为 `O(depth)`。
 
@@ -219,10 +219,10 @@ WorldPop ArcGIS ────────┤──→ 下载 ─→ 对齐 ─→
 
 海岸线附近常见问题是 DEM 或地表分类把有人口的沿海城区标成水。GeoBaker 会用人口作为辅助证据：
 
-1. `fix_water_consistency`：`zone=WATER` 且 `pop` 高于阈值的像素修正为陆地类。
-2. `_enforce_water_value_consistency`：明显水体像素保留为水。
+1. `fix_water_consistency`：ESA 显式水体和无覆盖区优先保水；只有非保护水体才允许被人口或正高程救回陆地。
+2. `_enforce_water_value_consistency`：明显无人口的低洼水体保留为水，同时给负海拔陆地留下编码空间。
 3. `_enforce_water_zone_consistency`：水体上的人口和 urban 数据清零。
-4. 四叉树构建时继续保护有人口的小区域，避免粗化后又变回水。
+4. 四叉树构建只编码清理后的 zone，不再在树构建阶段用人口反推水陆。
 
 ## 输出格式
 
@@ -234,10 +234,11 @@ WorldPop ArcGIS ────────┤──→ 下载 ─→ 对齐 ─→
 | Index | 1,036,800 bytes | 360 x 180 网格的 `(offset, size)` 对 |
 | Data | 可变 | zstd 压缩的瓦片数据块 |
 
-### 瓦片二进制 (QTR5)
+### 瓦片二进制 (QTR5/QTR6)
 
 - **水域瓦片**：1 字节 (`0xFF`)
-- **数据瓦片**：2 x N 字节，16bit 节点数组，DFS 前序
+- **旧 QTR5 数据瓦片**：2 x N 字节，16bit 节点数组，DFS 前序
+- **QTR6 数据瓦片**：16 字节格式头 + 2 x N 字节节点数组；节点仍为 16bit，便于旧数据兼容与新数据识别
 
 ### 精度说明
 
@@ -253,12 +254,12 @@ MIT License，详见 [LICENSE](LICENSE)。
 
 # GeoBaker (English)
 
-GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR5 format) for games, simulations, and offline geospatial queries.
+GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR5/QTR6 format) for games, simulations, and offline geospatial queries.
 
 ## Features
 
 - **Multi-source data fusion**: DEM (30m), population (1km), and land cover (100m), using public data sources by default.
-- **Adaptive quadtree (QTR5)**: 16-bit nodes, nonlinear elevation encoding, and budget-aware splitting.
+- **Adaptive quadtree (QTR5/QTR6)**: 16-bit nodes, nonlinear elevation encoding, and budget-aware splitting.
 - **Compact binary format**: zstd-compressed GeoPack files with a 360 x 180 tile index.
 - **Water/land consistency**: optional ESA-based handling for NO_DATA tiles instead of blindly writing water.
 - **Coastal city correction**: uses population as supporting evidence for inhabited coastlines.
@@ -412,7 +413,7 @@ GeoBaker/
 
 ## Architecture
 
-### QTR5 Format (16-bit Nodes)
+### QTR5/QTR6 Format (16-bit Nodes)
 
 ```text
 Terrain leaf:    [1bit is_leaf=1][11bit elevation(non-linear)][2bit gradient][2bit zone]
@@ -420,7 +421,7 @@ Population leaf: [1bit is_leaf=1][12bit pop density(log)][3bit urban type]
 Branch node:     [1bit is_leaf=0][15bit subtree_size]
 ```
 
-- **Nonlinear elevation**: compact meter buckets for low and high terrain.
+- **Nonlinear elevation**: QTR5 is unsigned 0-8190m; QTR6 uses the same 11-bit field for roughly -512m to 8176m, preserving negative land elevation.
 - **Population encoding**: logarithmic 12-bit density encoding.
 - **DFS pre-order traversal**: navigate by skipping subtrees with `subtree_size`.
 
@@ -475,10 +476,10 @@ decide whether a tile is likely water:
 Coastline-adjacent data can classify inhabited land as water. GeoBaker uses
 population as supporting evidence:
 
-1. `fix_water_consistency` fixes `zone=WATER` pixels with meaningful population.
-2. `_enforce_water_value_consistency` keeps obvious water as water.
+1. `fix_water_consistency` protects ESA explicit water and no-coverage pixels; only unprotected inferred water can be rescued by population or positive DEM.
+2. `_enforce_water_value_consistency` keeps clear low/no-pop water as water while leaving room for negative land elevations.
 3. `_enforce_water_zone_consistency` clears population and urban metadata on water.
-4. Quadtree building keeps small populated areas from being averaged back into water.
+4. Quadtree building encodes the cleaned zone only; population no longer flips water during tree construction.
 
 ## Output Format
 
@@ -490,10 +491,11 @@ population as supporting evidence:
 | Index | 1,036,800 bytes | 360 x 180 grid of `(offset, size)` pairs |
 | Data | Variable | zstd-compressed tile payloads |
 
-### Tile Binary (QTR5)
+### Tile Binary (QTR5/QTR6)
 
 - **Water tile**: 1 byte (`0xFF`)
-- **Data tile**: 2 x N bytes, 16-bit node array in DFS pre-order
+- **Legacy QTR5 data tile**: 2 x N bytes, 16-bit node array in DFS pre-order
+- **QTR6 data tile**: 16-byte format header + 2 x N node bytes; nodes remain 16-bit for compactness and compatibility
 
 ### Precision Notes
 

@@ -1,10 +1,13 @@
 """
 Core: constants, encoding, quadtree
 
-QTR5 format: 16bit nodes, DFS pre-order, subtree_size navigation
+QTR5/QTR6 format: 16bit nodes, DFS pre-order, subtree_size navigation
 - Terrain leaf: [1b is_leaf=1][11b elevation][2b gradient][2b zone]
 - Pop leaf:     [1b is_leaf=1][12b pop_density][3b urban_type]
 - Branch:       [1b is_leaf=0][15b subtree_size]
+
+QTR5 elevation is unsigned. QTR6 keeps the same 16-bit node layout but
+uses a signed 11-bit elevation code so negative land elevations survive.
 """
 
 import math
@@ -76,6 +79,10 @@ OVERPASS_ENDPOINTS = [
 
 _GPK_MAGIC = b"GPK3"
 _POP_MAGIC = b"GPOP"
+QTR5_TILE_MAGIC = b"QTR5"
+QTR6_TILE_MAGIC = b"QTR6"
+TILE_HEADER_SIZE = 16
+DEFAULT_TERRAIN_CODEC = os.environ.get("GEO_BAKER_TERRAIN_CODEC", "qtr6").lower()
 _GPK_HEADER_SIZE = 32
 _GPK_GRID_W, _GPK_GRID_H = 360, 180
 _GPK_INDEX_SIZE = _GPK_GRID_W * _GPK_GRID_H * 16
@@ -83,23 +90,56 @@ MAX_PACK_SIZE_MB = 1024
 
 
 # ── Encoding ───────────────────────────────────────────────────────
-# Elevation: 11-bit piecewise-linear
+# QTR5 elevation: unsigned 11-bit piecewise-linear
 # 0-511m@1m, 512-1535m@2m, 1536-3583m@4m, 3584-8190m@8m
 
-def encode_elevation(meters):
-    m = max(0, min(8190, int(meters)))
+def encode_elevation_qtr5(meters):
+    m = max(0, min(8190, int(round(meters))))
     if m <= 511: return m
     if m <= 1535: return 512 + (m - 512) // 2
     if m <= 3583: return 1024 + (m - 1536) // 4
     return 1536 + min(511, (m - 3584) // 8)
 
 
-def decode_elevation(s):
+def decode_elevation_qtr5(s):
     s = max(0, min(2047, int(s)))
     if s <= 511: return s
     if s <= 1023: return 512 + (s - 512) * 2
     if s <= 1535: return 1536 + (s - 1024) * 4
     return 3584 + (s - 1536) * 8
+
+
+# QTR6 elevation: signed 11-bit piecewise-linear.  The 16-bit terrain
+# node layout is unchanged; only the elevation codebook changes.
+def encode_elevation_qtr6(meters):
+    m = max(-512, min(8176, int(round(meters))))
+    if m < 0:
+        return max(0, min(127, int(round((m + 512) / 4.0))))
+    if m <= 511:
+        return 128 + m
+    if m <= 1535:
+        return 640 + (m - 512) // 2
+    if m <= 3583:
+        return 1152 + (m - 1536) // 4
+    return 1664 + min(383, (m - 3584) // 12)
+
+
+def decode_elevation_qtr6(s):
+    s = max(0, min(2047, int(s)))
+    if s <= 127:
+        return -512 + s * 4
+    if s <= 639:
+        return s - 128
+    if s <= 1151:
+        return 512 + (s - 640) * 2
+    if s <= 1663:
+        return 1536 + (s - 1152) * 4
+    return 3584 + (s - 1664) * 12
+
+
+# Backward-compatible names keep QTR5 semantics for old callers/tests.
+encode_elevation = encode_elevation_qtr5
+decode_elevation = decode_elevation_qtr5
 
 
 def encode_pop_density(d):
@@ -148,23 +188,40 @@ def _grad_level_from_img(grad_sub):
 
 # ── 16-bit Node Codec ─────────────────────────────────────────────
 
-def encode_leaf_node_16(elev_m, zone, gradient=0):
-    e = max(0, min(2047, encode_elevation(elev_m)))
-    return struct.pack('<H', (1 << 15) | (e << 4) | (max(0, min(3, int(gradient))) << 2)
+def _pack_terrain_leaf(elev_code, zone, gradient=0):
+    return struct.pack('<H', (1 << 15) | ((max(0, min(2047, int(elev_code)))) << 4)
+                       | (max(0, min(3, int(gradient))) << 2)
                        | max(0, min(3, int(zone))))
+
+
+def encode_leaf_node_16(elev_m, zone, gradient=0):
+    return _pack_terrain_leaf(encode_elevation_qtr5(elev_m), zone, gradient)
+
+
+def encode_leaf_node_qtr6(elev_m, zone, gradient=0):
+    return _pack_terrain_leaf(encode_elevation_qtr6(elev_m), zone, gradient)
 
 
 def encode_branch_node_16(subtree_size):
     return struct.pack('<H', max(0, min(0x7FFF, int(subtree_size))))
 
 
-def decode_node_16(raw):
+def _decode_terrain_node(raw, decode_elev_fn, codec):
     v = struct.unpack('<H', raw)[0]
     if v >> 15:
         es = (v >> 4) & 0x7FF
-        return {'is_leaf': True, 'elevation': decode_elevation(es),
-                'elevation_stored': es, 'gradient_level': (v >> 2) & 3, 'zone': v & 3}
+        return {'is_leaf': True, 'elevation': decode_elev_fn(es),
+                'elevation_stored': es, 'elevation_codec': codec,
+                'gradient_level': (v >> 2) & 3, 'zone': v & 3}
     return {'is_leaf': False, 'subtree_size': v & 0x7FFF}
+
+
+def decode_node_16(raw):
+    return _decode_terrain_node(raw, decode_elevation_qtr5, 'qtr5')
+
+
+def decode_node_qtr6(raw):
+    return _decode_terrain_node(raw, decode_elevation_qtr6, 'qtr6')
 
 
 def encode_pop_leaf_node(density, urban):
@@ -186,6 +243,26 @@ def encode_water_tile():
 
 
 WATER_BYTE = encode_water_tile()
+
+
+def terrain_tile_header(codec=DEFAULT_TERRAIN_CODEC):
+    magic = QTR6_TILE_MAGIC if codec == 'qtr6' else QTR5_TILE_MAGIC
+    return magic + struct.pack('<HHII', 1, 0, 0, 0)
+
+
+def wrap_terrain_tile(raw, codec=DEFAULT_TERRAIN_CODEC):
+    if codec == 'raw' or raw == WATER_BYTE:
+        return raw
+    if len(raw) >= TILE_HEADER_SIZE and raw[:4] in (QTR5_TILE_MAGIC, QTR6_TILE_MAGIC):
+        return raw
+    return terrain_tile_header(codec) + raw
+
+
+def unwrap_terrain_tile(raw):
+    if len(raw) >= TILE_HEADER_SIZE and raw[:4] in (QTR5_TILE_MAGIC, QTR6_TILE_MAGIC):
+        codec = 'qtr6' if raw[:4] == QTR6_TILE_MAGIC else 'qtr5'
+        return raw[TILE_HEADER_SIZE:], codec
+    return raw, 'qtr5'
 
 
 # ── Quadtree Builder (unified) ─────────────────────────────────────
@@ -266,7 +343,8 @@ def _zone_needs_split(zone_data):
 
 
 def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
-                        max_nodes=MAX_NODES, force_depth=FORCE_DEPTH_TERRAIN):
+                        max_nodes=MAX_NODES, force_depth=FORCE_DEPTH_TERRAIN,
+                        codec=DEFAULT_TERRAIN_CODEC):
     # Precompute gradient image once — avoids 4 tmp array allocs per leaf
     grad_img = _precompute_grad_img(dem)
     pop_arr = pop  # may be None
@@ -295,7 +373,8 @@ def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
         # land from positive elevation here: high-altitude lakes and rivers are
         # still water, and DEM can be positive over inland water surfaces.
         me = 0.0 if zv == ZONE_WATER else float(d.mean())
-        nodes.append(encode_leaf_node_16(me, zv, _grad_level_from_img(gi)))
+        encoder = encode_leaf_node_qtr6 if codec == 'qtr6' else encode_leaf_node_16
+        nodes.append(encoder(me, zv, _grad_level_from_img(gi)))
 
     arrays = [dem, zone, pop_arr, grad_img]
     return _build_quadtree(arrays, _split, _leaf, max_depth, max_nodes, force_depth)
@@ -356,13 +435,21 @@ def _navigate(nodes_raw, frac_lat, frac_lon, decode_fn):
     return None
 
 
-def navigate_qtr5(nodes_raw, frac_lat, frac_lon):
+def _navigate_terrain(nodes_raw, frac_lat, frac_lon, decode_fn):
     nc = len(nodes_raw) // 2
     if nc > 1:
-        root = decode_node_16(nodes_raw[0:2])
+        root = decode_fn(nodes_raw[0:2])
         if not root['is_leaf'] and root.get('subtree_size', 0) != nc:
             return None
-    return _navigate(nodes_raw, frac_lat, frac_lon, decode_node_16)
+    return _navigate(nodes_raw, frac_lat, frac_lon, decode_fn)
+
+
+def navigate_qtr5(nodes_raw, frac_lat, frac_lon):
+    return _navigate_terrain(nodes_raw, frac_lat, frac_lon, decode_node_16)
+
+
+def navigate_qtr6(nodes_raw, frac_lat, frac_lon):
+    return _navigate_terrain(nodes_raw, frac_lat, frac_lon, decode_node_qtr6)
 
 
 def navigate_qtr5_pop(nodes_raw, frac_lat, frac_lon):

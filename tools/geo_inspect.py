@@ -24,8 +24,8 @@ from geo_baker_pkg.core import (
     _GPK_HEADER_SIZE, _GPK_GRID_W, _GPK_GRID_H, _GPK_INDEX_SIZE,
     ZONE_NAMES, URBAN_NAMES, GRADIENT_NAMES,
     ZONE_WATER, MAX_PACK_SIZE_MB,
-    decode_node_16, decode_pop_leaf_node, decode_elevation,
-    verify_tile, write_water_tile,
+    decode_node_16, decode_node_qtr6, decode_pop_leaf_node, decode_elevation,
+    unwrap_terrain_tile, verify_tile, write_water_tile,
 )
 from geo_baker_pkg.io import query_elevation, query_elevation_pack, query_population, query_population_pack
 from geo_baker_pkg.pipeline import is_likely_ocean, land_index_sufficient, MIN_LAND_INDEX_TILES_TRUST
@@ -72,10 +72,12 @@ def cmd_tile_info(args):
         print(f"  Terrain / 地形:  {size} bytes ({'water' if size <= 1 else 'data'})")
         if size > 1:
             with open(tile_path, 'rb') as f:
-                data = f.read()
+                raw = f.read()
+            data, codec = unwrap_terrain_tile(raw)
             node_count = len(data) // 2
-            root = decode_node_16(data[:2])
-            print(f"  Nodes / 节点数:  {node_count}")
+            decode_fn = decode_node_qtr6 if codec == 'qtr6' else decode_node_16
+            root = decode_fn(data[:2])
+            print(f"  Nodes / 节点数:  {node_count} ({codec})")
             print(f"  Root / 根节点:   subtree_size={root.get('subtree_size', '?')}")
     else:
         print(f"  Terrain / 地形:  NOT FOUND / 未找到")
@@ -161,21 +163,19 @@ def cmd_validate(args):
             try:
                 with open(qf, 'rb') as f:
                     raw = f.read()
-                if len(raw) >= 16 and raw[:4] == b'QTR5':
-                    data = raw[16:]
-                else:
-                    data = raw
+                data, codec = unwrap_terrain_tile(raw)
+                decode_fn = decode_node_qtr6 if codec == 'qtr6' else decode_node_16
                 if len(data) % 2 != 0:
                     errors.append((lat, lon, f"odd byte count / 奇数字节数: {len(data)}"))
                     continue
                 if len(data) < 2:
                     errors.append((lat, lon, "empty node payload / 空载荷"))
                     continue
-                root = decode_node_16(data[0:2])
+                root = decode_fn(data[0:2])
                 if root.get('is_leaf', True):
                     errors.append((lat, lon, "root is leaf / 根节点是叶节点"))
-                elif not verify_tile(data, decode_node_16):
-                    errors.append((lat, lon, "verify_tile failed / QTR5 结构或导航失败"))
+                elif not verify_tile(data, decode_fn):
+                    errors.append((lat, lon, f"verify_tile failed / {codec.upper()} 结构或导航失败"))
             except Exception as e:
                 errors.append((lat, lon, f"decode error / 解码错误: {e}"))
 

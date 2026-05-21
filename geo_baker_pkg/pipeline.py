@@ -27,18 +27,18 @@ from .core import (
     TILE_DIR, STAC_PC, STAC_E84,
     OPEN_ELEVATION_URL, WORLDPOP_ARCGIS_URL,
     ZONE_WATER, ZONE_NATURAL, ESA_TO_ZONE, ESA_URBAN_CLASS, ESA_WATER_CLASS,
-    _POP_NOISE_FLOOR, TARGET_SIZE, MAX_NODES, WATER_BYTE,
+    _POP_NOISE_FLOOR, TARGET_SIZE, MAX_NODES, WATER_BYTE, DEFAULT_TERRAIN_CODEC,
     build_adaptive_tree, build_adaptive_pop_tree,
-    navigate_qtr5, navigate_qtr5_pop,
-    decode_node_16, decode_pop_leaf_node,
-    write_tile_binary, write_water_tile,
+    navigate_qtr5, navigate_qtr6, navigate_qtr5_pop,
+    decode_node_16, decode_node_qtr6, decode_pop_leaf_node,
+    write_tile_binary, write_water_tile, wrap_terrain_tile, unwrap_terrain_tile,
     verify_tile,
 )
 
 logger = logging.getLogger('geo_baker')
 
-DEFAULT_TERRAIN_NODE_CAP = max(5000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_TERRAIN_NODE_CAP", "24000"))))
-DEFAULT_POP_NODE_CAP = max(3000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_POP_NODE_CAP", "20000"))))
+DEFAULT_TERRAIN_NODE_CAP = max(5000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_TERRAIN_NODE_CAP", "30000"))))
+DEFAULT_POP_NODE_CAP = max(2000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_POP_NODE_CAP", "16000"))))
 
 
 # ── Land Tile Index (ESA WorldCover via STAC) ───────────────────────
@@ -220,12 +220,37 @@ def _inset_bbox(bbox, eps=0.001):
     return [left + eps, bottom + eps, right - eps, top - eps]
 
 
+def _merge_nonzero_raster(base, data):
+    """Fill zero/no-data holes in one STAC read with non-zero pixels from another."""
+    if data is None:
+        return base
+    arr = np.asarray(data)
+    if arr.size == 0:
+        return base
+    if base is None:
+        return arr.copy()
+    if base.shape != arr.shape:
+        return base
+    out = base.copy()
+    fill = np.isfinite(arr) & (np.abs(arr) > 1e-6)
+    holes = (~np.isfinite(out)) | (np.abs(out) <= 1e-6)
+    out[holes & fill] = arr[holes & fill]
+    return out
+
+
 def _fetch_stac_raster(stac_url, collection, bbox, asset_keys=("data", "DEM"),
                        min_nonzero_fraction=0.0, search_bbox=None):
-    """Unified STAC raster fetcher for DEM and ESA."""
+    """Unified STAC raster fetcher for DEM and ESA.
+
+    DEM COG footprints often do not align to GeoBaker's 1 degree cells. A
+    single item can return a mostly valid window with zero-filled strips where
+    it does not cover the requested bbox.  For DEM reads, callers pass a
+    positive min_nonzero_fraction; in that mode we merge candidate assets by
+    filling zero/no-data holes with non-zero pixels from later candidates.
+    """
     try:
         cat = _open_stac(stac_url)
-        items = list(cat.search(collections=[collection], bbox=search_bbox or bbox, max_items=10).items())
+        items = list(cat.search(collections=[collection], bbox=search_bbox or bbox, max_items=20).items())
         if not items: return None
         try:
             import shapely.geometry as sg
@@ -236,6 +261,8 @@ def _fetch_stac_raster(stac_url, collection, bbox, asset_keys=("data", "DEM"),
             pass
         best_data = None
         best_fraction = -1.0
+        merged = None
+        merged_fraction = -1.0
         for item in items:
             for key in asset_keys:
                 asset = item.assets.get(key)
@@ -246,13 +273,18 @@ def _fetch_stac_raster(stac_url, collection, bbox, asset_keys=("data", "DEM"),
                     if min_nonzero_fraction <= 0:
                         return data
                     frac = _raster_nonzero_fraction(data)
-                    if frac >= min_nonzero_fraction:
-                        return data
                     if frac > best_fraction:
                         best_fraction = frac
                         best_data = data
+                    merged = _merge_nonzero_raster(merged, data)
+                    merged_fraction = _raster_nonzero_fraction(merged)
+                    if merged_fraction >= min_nonzero_fraction and merged_fraction >= 0.995:
+                        return merged
         if min_nonzero_fraction <= 0:
             return best_data
+        if merged is not None and merged_fraction > best_fraction:
+            return merged
+        return best_data
     except Exception:
         pass
     return None
@@ -484,25 +516,32 @@ def _concurrent_download(lat, lon, max_conn=200):
 
 def _build_zone_layers(esa_data):
     if esa_data is not None:
-        # ESA class 80 is explicit surface water.  Class 0 is ocean/no-coverage in
-        # many COGs, so it starts as water but is not protected from later land fixes.
+        # ESA class 80 is explicit water. Class 0 is no-coverage/ocean in
+        # WorldCover COGs; keep it protected from DEM/pop rescue to avoid
+        # creating fake land between open ocean and real coastlines.
         zone = np.full_like(esa_data, ZONE_WATER, dtype=np.uint8)
         for cls, zv in ESA_TO_ZONE.items():
             zone[esa_data == cls] = zv
         urban = (esa_data == ESA_URBAN_CLASS).astype(np.uint8)
         explicit_water = (esa_data == ESA_WATER_CLASS)
-        return zone, urban, explicit_water.astype(np.uint8)
+        no_coverage = (esa_data == 0)
+        protected_water = explicit_water | no_coverage
+        explicit_land = (~protected_water) & (zone != ZONE_WATER)
+        return (zone, urban, protected_water.astype(np.uint8),
+                explicit_land.astype(np.uint8), no_coverage.astype(np.uint8))
     return (np.full((TARGET_SIZE, TARGET_SIZE), ZONE_NATURAL, dtype=np.uint8),
             np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=np.uint8),
+            np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=np.uint8),
+            np.ones((TARGET_SIZE, TARGET_SIZE), dtype=np.uint8),
             np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=np.uint8))
 
 
 def _build_zone_grid(esa_data):
-    zone, urban, _ = _build_zone_layers(esa_data)
+    zone, urban, *_ = _build_zone_layers(esa_data)
     return zone, urban
 
 
-def align_tile_data(dem, pop, zone, urban=None, explicit_water=None, target_size=TARGET_SIZE):
+def align_tile_data(dem, pop, zone, urban=None, explicit_water=None, explicit_land=None, no_coverage=None, target_size=TARGET_SIZE):
     import scipy.ndimage
 
     def _resize(arr, sz):
@@ -515,10 +554,12 @@ def align_tile_data(dem, pop, zone, urban=None, explicit_water=None, target_size
     return (_resize(dem, target_size), _resize(pop, target_size),
             _resize(zone, target_size),
             _resize(urban, target_size) if urban is not None else None,
-            _resize(explicit_water, target_size).astype(bool) if explicit_water is not None else None)
+            _resize(explicit_water, target_size).astype(bool) if explicit_water is not None else None,
+            _resize(explicit_land, target_size).astype(bool) if explicit_land is not None else None,
+            _resize(no_coverage, target_size).astype(bool) if no_coverage is not None else None)
 
 
-def patch_dem_zero_holes(lat, lon, dem, zero_fraction_threshold=0.02):
+def patch_dem_zero_holes(lat, lon, dem, zero_fraction_threshold=0.001):
     """Patch zero-valued DEM holes with Terrarium before water/land cleanup."""
     if dem is None:
         return dem
@@ -556,23 +597,28 @@ def patch_dem_zero_holes(lat, lon, dem, zero_fraction_threshold=0.02):
 
 
 def fix_water_consistency(dem, pop, zone, urban, explicit_water=None, coastal_threshold=10.0):
-    """Keep explicit water while correcting only inferred/no-coverage water."""
+    """Apply final water invariants without inventing land from ocean/no-coverage.
+
+    ``explicit_water`` is a protected-water mask.  It includes ESA class 80 and
+    ESA class 0/no-coverage.  Population and positive DEM are intentionally not
+    allowed to rescue those pixels into land; that was the source of fake
+    natural strips between ocean and coastlines.
+    """
     if zone is None or pop is None:
         return
     protected = np.asarray(explicit_water, dtype=bool) if explicit_water is not None else np.zeros_like(zone, dtype=bool)
     inferred_water = (zone == ZONE_WATER) & ~protected
 
-    # Pass 1: coastal cities — population proves habitation, but never overrides
-    # ESA explicit water (lakes/rivers often inherit nearby population density).
+    # Pass 1: keep only genuinely inferred water rescue. ESA water and class-0
+    # ocean/no-coverage are protected, so population cannot create offshore land.
     coast = inferred_water & (pop > coastal_threshold)
     if np.any(coast):
         zone[coast] = ZONE_NATURAL
         if urban is not None:
             urban[coast] = 0
-        logger.debug(f"[FIX] coastal: {int(np.sum(coast))} px")
+        logger.debug(f"[FIX] coastal inferred-water->land: {int(np.sum(coast))} px")
 
-    # Pass 2: positive DEM can rescue inferred water/no-coverage, but explicit
-    # water may be high-altitude lakes/rivers and must remain water.
+    # Pass 2: positive DEM can rescue only non-protected inferred water.
     if dem is not None:
         inferred_water = (zone == ZONE_WATER) & ~protected
         land = inferred_water & (dem > 0)
@@ -580,14 +626,18 @@ def fix_water_consistency(dem, pop, zone, urban, explicit_water=None, coastal_th
             zone[land] = ZONE_NATURAL
             logger.debug(f"[FIX] elev>0 inferred-water: {int(np.sum(land))} px")
 
-    # Pass 3: bathymetry fallback marks open water even when ESA is missing.
+    # Pass 3: bathymetry fallback may confirm inferred water, but
+    # it must never overwrite explicit ESA land.  Negative-elevation land exists
+    # around the Caspian, Dead Sea, Qattara Depression, salt lakes, and sparse
+    # coasts, so dem<0 alone is not evidence that a land zone is water.
     if dem is not None:
-        bathy = (dem < -5.0) & (pop <= _POP_NOISE_FLOOR)
+        inferred_water = (zone == ZONE_WATER) & ~protected
+        bathy = inferred_water & (dem < -5.0) & (pop <= _POP_NOISE_FLOOR)
         if np.any(bathy):
             zone[bathy] = ZONE_WATER
             if urban is not None:
                 urban[bathy] = 0
-            logger.debug(f"[FIX] bathy<0: {int(np.sum(bathy))} px")
+            logger.debug(f"[FIX] bathy inferred-water<0: {int(np.sum(bathy))} px")
 
     # Pass 4: water zones must have zero pop/urban/elevation in the packed game layer.
     water = zone == ZONE_WATER
@@ -638,17 +688,24 @@ def _tile_node_budgets(zone, pop):
     water_mixed = counts[ZONE_WATER] > 0 and counts[ZONE_WATER] < z.size
     max_pop = float(np.nanmax(pop)) if pop is not None and pop.size else 0.0
 
-    if water_mixed or zone_mixed or max_pop > 50:
+    water_fraction = float(counts[ZONE_WATER]) / max(z.size, 1)
+    if water_mixed:
         terrain_budget = terrain_cap
+    elif zone_mixed or max_pop > 50:
+        terrain_budget = min(terrain_cap, 24000)
+    elif water_fraction > 0.01:
+        terrain_budget = min(terrain_cap, 18000)
     else:
         terrain_budget = min(terrain_cap, 12000)
 
-    if max_pop > 1000:
+    if max_pop > 5000:
         pop_budget = pop_cap
-    elif max_pop > 10:
+    elif max_pop > 1000:
         pop_budget = min(pop_cap, 12000)
+    elif max_pop > 10:
+        pop_budget = min(pop_cap, 6000)
     else:
-        pop_budget = min(pop_cap, 4000)
+        pop_budget = min(pop_cap, 2000)
     return terrain_budget, pop_budget
 
 
@@ -662,10 +719,11 @@ def _compute_tile(lat, lon, dem, pop, zone, urban):
     qtree_path, pop_path = _tile_paths(lat, lon)
     terrain_budget, pop_budget = _tile_node_budgets(zone, pop)
 
-    terrain = build_adaptive_tree(dem, zone, pop, max_nodes=terrain_budget)
-    if not verify_tile(terrain, decode_node_16):
+    terrain = build_adaptive_tree(dem, zone, pop, max_nodes=terrain_budget, codec=DEFAULT_TERRAIN_CODEC)
+    terrain_decode = decode_node_qtr6 if DEFAULT_TERRAIN_CODEC == 'qtr6' else decode_node_16
+    if not verify_tile(terrain, terrain_decode):
         logger.error(f"[VERIFY] {lon}_{lat}: terrain tree FAILED verification")
-    write_tile_binary(terrain, qtree_path)
+    write_tile_binary(wrap_terrain_tile(terrain, DEFAULT_TERRAIN_CODEC), qtree_path)
     nc = len(terrain) // 2
     if nc >= terrain_budget - 64:
         logger.warning(f"[BUDGET] {lon}_{lat}: terrain nodes near budget ({nc}/{terrain_budget})")
@@ -720,15 +778,17 @@ def _bake_tile_core(lat, lon, offline=False, max_conn=200,
                 return {'status': 'ocean', 'nodes': 0}
         return {'status': 'no_data', 'nodes': 0}
 
-    zone, urban, explicit_water = _build_zone_layers(esa)
-    aligned = align_tile_data(dem, pop, zone, urban, explicit_water)
+    zone, urban, explicit_water, explicit_land, no_coverage = _build_zone_layers(esa)
+    aligned = align_tile_data(dem, pop, zone, urban, explicit_water, explicit_land, no_coverage)
     if len(aligned) == 4:
         # Compatibility for tests or external callers monkeypatching the old
         # four-value align_tile_data signature.
         dem, pop, zone, urban = aligned
         explicit_water = None
-    else:
+    elif len(aligned) == 5:
         dem, pop, zone, urban, explicit_water = aligned
+    else:
+        dem, pop, zone, urban, explicit_water, explicit_land, no_coverage = aligned
     dem = patch_dem_zero_holes(lat, lon, dem)
     fix_water_consistency(dem, pop, zone, urban, explicit_water)
     if np.count_nonzero(zone == ZONE_WATER) / max(zone.size, 1) > 0.995:
@@ -1202,11 +1262,12 @@ def _scan_problem_tiles(pop_threshold=10.0, grid_size=3, min_hits=2):
         try:
             with open(qf, 'rb') as f: traw = f.read()
             with open(pp, 'rb') as f: praw = f.read()
-            tdata = traw[16:] if traw[:4] == b'QTR5' else traw
-            pdata = praw[16:] if praw[:4] == b'QTR5' else praw
+            tdata, tcodec = unwrap_terrain_tile(traw)
+            pdata = praw[16:] if praw[:4] in (b'QTR5', b'QTR6') else praw
+            tnav = navigate_qtr6 if tcodec == 'qtr6' else navigate_qtr5
             hits = water_hits = valid = 0
             for fl, flo in pts:
-                tn = navigate_qtr5(tdata, fl, flo) if len(tdata) > 1 else {'is_leaf': True, 'zone': ZONE_WATER}
+                tn = tnav(tdata, fl, flo) if len(tdata) > 1 else {'is_leaf': True, 'zone': ZONE_WATER}
                 pn = navigate_qtr5_pop(pdata, fl, flo) if len(pdata) > 1 else None
                 if not tn or not tn.get('is_leaf'): continue
                 valid += 1
@@ -1277,11 +1338,11 @@ def fix_coastal_batch(cities_json_path="data/global_cities.json", pop_threshold=
         if not os.path.exists(pp): continue
         try:
             with open(tp, 'rb') as f: raw = f.read()
-            td = raw[16:] if raw[:4] == b'QTR5' else raw
-            n = navigate_qtr5(td, 0.5, 0.5)
+            td, tcodec = unwrap_terrain_tile(raw)
+            n = (navigate_qtr6 if tcodec == 'qtr6' else navigate_qtr5)(td, 0.5, 0.5)
             if not n or n.get('zone') != ZONE_WATER: continue
             with open(pp, 'rb') as f: raw = f.read()
-            pd = raw[16:] if raw[:4] == b'QTR5' else raw
+            pd = raw[16:] if raw[:4] in (b'QTR5', b'QTR6') else raw
             pn = navigate_qtr5_pop(pd, 0.5, 0.5)
             if pn and pn.get('pop_density', 0) > pop_threshold:
                 problems.setdefault((lai, loi), []).append(city.get('n', '?'))

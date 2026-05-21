@@ -19,8 +19,9 @@ from .core import (
     MAX_PACK_SIZE_MB,
     ZONE_WATER, ZONE_NAMES, URBAN_NAMES, GRADIENT_NAMES,
     _POP_NOISE_FLOOR,
-    decode_node_16, decode_pop_leaf_node,
-    navigate_qtr5, navigate_qtr5_pop,
+    QTR5_TILE_MAGIC, QTR6_TILE_MAGIC, TILE_HEADER_SIZE,
+    decode_node_16, decode_node_qtr6, decode_pop_leaf_node,
+    navigate_qtr5, navigate_qtr6, navigate_qtr5_pop, unwrap_terrain_tile,
 )
 
 logger = logging.getLogger('geo_baker')
@@ -352,9 +353,9 @@ class GeoPackReader:
             return None
         if len(blob) <= 1:
             return {'is_leaf': True, 'elevation': 0, 'gradient_level': 0, 'zone': ZONE_WATER}
-        if len(blob) >= 16 and blob[:4] == b'QTR5':
-            blob = blob[16:]
-        return navigate_qtr5(blob, lat - lat_int, lon - lon_int)
+        payload, codec = unwrap_terrain_tile(blob)
+        nav = navigate_qtr6 if codec == 'qtr6' else navigate_qtr5
+        return nav(payload, lat - lat_int, lon - lon_int)
 
     def query_population(self, lat, lon):
         lat_int, lon_int = int(np.floor(lat)), int(np.floor(lon))
@@ -363,8 +364,8 @@ class GeoPackReader:
             return None
         if len(blob) <= 1:
             return {'is_leaf': True, 'pop_density': 0, 'urban_zone': 0}
-        if len(blob) >= 16 and blob[:4] == b'QTR5':
-            blob = blob[16:]
+        if len(blob) >= TILE_HEADER_SIZE and blob[:4] in (QTR5_TILE_MAGIC, QTR6_TILE_MAGIC):
+            blob = blob[TILE_HEADER_SIZE:]
         return navigate_qtr5_pop(blob, lat - lat_int, lon - lon_int)
 
     def close(self):
@@ -394,8 +395,8 @@ def query_elevation(lat, lon):
         return _normalize_elevation_result({'is_leaf': True, 'elevation': 0, 'gradient_level': 0, 'zone': ZONE_WATER})
     with open(tile_path, 'rb') as f:
         raw = f.read()
-    data = raw[16:] if raw[:4] == b'QTR5' else raw
-    node = navigate_qtr5(data, lat - lat_int, lon - lon_int)
+    data, codec = unwrap_terrain_tile(raw)
+    node = (navigate_qtr6 if codec == 'qtr6' else navigate_qtr5)(data, lat - lat_int, lon - lon_int)
     return _normalize_elevation_result(node)
 
 
@@ -415,7 +416,7 @@ def query_population(lat, lon):
         return {'pop_density': 0, 'urban_zone': 0, 'urban_name': URBAN_NAMES.get(0, 'Unknown')}
     with open(tile_path, 'rb') as f:
         raw = f.read()
-    data = raw[16:] if raw[:4] == b'QTR5' else raw
+    data = raw[TILE_HEADER_SIZE:] if raw[:4] in (QTR5_TILE_MAGIC, QTR6_TILE_MAGIC) else raw
     node = navigate_qtr5_pop(data, lat - lat_int, lon - lon_int)
     if node is None: return None
     node['urban_name'] = URBAN_NAMES.get(node.get('urban_zone', 0), 'Unknown')

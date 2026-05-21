@@ -31,7 +31,7 @@ from geo_baker_pkg.core import (
     TILE_DIR, ZONE_WATER, ZONE_NATURAL, ZONE_FOREST, ZONE_HARSH,
     ZONE_NAMES, GRADIENT_NAMES, URBAN_NAMES,
     _GPK_MAGIC, _POP_MAGIC, _GPK_HEADER_SIZE, _GPK_GRID_W, _GPK_GRID_H, _GPK_INDEX_SIZE,
-    decode_node_16, decode_pop_leaf_node, decode_elevation, decode_pop_density,
+    decode_node_16, decode_node_qtr6, decode_pop_leaf_node, decode_elevation, decode_pop_density, unwrap_terrain_tile,
     navigate_qtr5, navigate_qtr5_pop,
 )
 from geo_baker_pkg.io import query_elevation, query_population
@@ -76,10 +76,13 @@ URBAN_LABELS = ["None", "Residential", "Commercial", "Industrial", "Mixed", "Ins
 def _draw_elevation(ax, elev_grid, extent, zone_grid=None, interpolation="nearest", title=None):
     """Draw elevation with explicit water and suspect zero-land colors."""
     elev = np.asarray(elev_grid, dtype=np.float32)
-    water = np.isfinite(elev) & (elev <= 0)
     if zone_grid is not None:
-        water = water | (np.isfinite(zone_grid) & (np.asarray(zone_grid) == ZONE_WATER))
-    suspect_zero_land = np.zeros_like(water, dtype=bool)
+        zone_arr = np.asarray(zone_grid)
+        water = np.isfinite(zone_arr) & (zone_arr == ZONE_WATER)
+        suspect_zero_land = (~water) & np.isfinite(elev) & (np.abs(elev) <= 1e-6)
+    else:
+        water = np.isfinite(elev) & (elev <= 0)
+        suspect_zero_land = np.zeros_like(water, dtype=bool)
 
     ax.set_facecolor(WATER_COLOR)
     if np.any(water):
@@ -316,7 +319,10 @@ def _load_tile_blob(tile_dir, lon_int, lat_int, kind):
     path = Path(tile_dir) / f"{lon_int}_{lat_int}{ext}"
     if not path.exists():
         return None
-    return path.read_bytes()
+    raw = path.read_bytes()
+    if kind == "terrain":
+        return unwrap_terrain_tile(raw)
+    return raw, "pop"
 
 
 def _iter_leaf_boxes(nodes_raw, decode_fn, lat_min, lat_max, lon_min, lon_max):
@@ -358,10 +364,14 @@ def _collect_boundary_segments(bbox, tile_dir, kind="pop", max_leaf_lines=25000)
 
     for lat_i in range(lat_start, lat_end + 1):
         for lon_i in range(lon_start, lon_end + 1):
-            blob = _load_tile_blob(tile_dir, lon_i, lat_i, kind)
+            loaded = _load_tile_blob(tile_dir, lon_i, lat_i, kind)
+            if not loaded:
+                continue
+            blob, codec = loaded
             if not blob or len(blob) <= 1:
                 continue
-            for la0, la1, lo0, lo1 in _iter_leaf_boxes(blob, decode_fn, lat_i, lat_i + 1, lon_i, lon_i + 1):
+            local_decode = decode_node_qtr6 if kind == "terrain" and codec == "qtr6" else decode_fn
+            for la0, la1, lo0, lo1 in _iter_leaf_boxes(blob, local_decode, lat_i, lat_i + 1, lon_i, lon_i + 1):
                 if la1 < lat0 or la0 > lat1 or lo1 < lon0 or lo0 > lon1:
                     continue
                 segs.append(((lo0, la0), (lo1, la0)))

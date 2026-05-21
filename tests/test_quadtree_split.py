@@ -8,9 +8,11 @@ from geo_baker_pkg.core import (
     ZONE_WATER,
     build_adaptive_pop_tree,
     build_adaptive_tree,
-    decode_node_16,
+    decode_node_qtr6,
     decode_pop_leaf_node,
     verify_tile,
+    wrap_terrain_tile,
+    unwrap_terrain_tile,
 )
 
 
@@ -21,12 +23,12 @@ class QuadtreeSplitTests(unittest.TestCase):
         zone = np.full((128, 128), ZONE_NATURAL, dtype=np.uint8)
 
         raw = build_adaptive_tree(dem, zone, max_nodes=200)
-        root = decode_node_16(raw[:2])
+        root = decode_node_qtr6(raw[:2])
 
         self.assertFalse(root["is_leaf"])
         self.assertLessEqual(len(raw) // 2, 200)
         self.assertEqual(root["subtree_size"], len(raw) // 2)
-        self.assertTrue(verify_tile(raw, decode_node_16))
+        self.assertTrue(verify_tile(raw, decode_node_qtr6))
 
     def test_flat_water_land_boundary_still_splits(self):
         dem = np.zeros((64, 64), dtype=np.float32)
@@ -36,7 +38,7 @@ class QuadtreeSplitTests(unittest.TestCase):
         raw = build_adaptive_tree(dem, zone)
 
         self.assertGreater(len(raw) // 2, 21)
-        self.assertTrue(verify_tile(raw, decode_node_16))
+        self.assertTrue(verify_tile(raw, decode_node_qtr6))
 
     def test_flat_landcover_boundary_still_splits(self):
         dem = np.full((64, 64), 25.0, dtype=np.float32)
@@ -46,7 +48,19 @@ class QuadtreeSplitTests(unittest.TestCase):
         raw = build_adaptive_tree(dem, zone)
 
         self.assertGreater(len(raw) // 2, 21)
-        self.assertTrue(verify_tile(raw, decode_node_16))
+        self.assertTrue(verify_tile(raw, decode_node_qtr6))
+
+    def test_qtr6_tile_header_round_trips_codec(self):
+        dem = np.full((16, 16), -28.0, dtype=np.float32)
+        zone = np.full((16, 16), ZONE_NATURAL, dtype=np.uint8)
+
+        raw = build_adaptive_tree(dem, zone, max_nodes=64, codec='qtr6')
+        wrapped = wrap_terrain_tile(raw, codec='qtr6')
+        payload, codec = unwrap_terrain_tile(wrapped)
+
+        self.assertEqual(codec, 'qtr6')
+        self.assertEqual(payload, raw)
+        self.assertTrue(verify_tile(payload, decode_node_qtr6))
 
     def test_population_hotspot_splits_without_large_variance_gate_only(self):
         pop = np.zeros((64, 64), dtype=np.float32)

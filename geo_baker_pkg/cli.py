@@ -132,7 +132,7 @@ def main():
     print("=" * 60)
     print("  Geo Baker - 全球地理数据管线")
     print("  CopDEM + WorldPop + ESA WorldCover")
-    print("  16bit节点 | QTR5/QTR6 | signed 11bit海拔 + 2bit坡度 + 2bit区域")
+    print("  16bit节点 | QTR6(兼容QTR5) | signed 11bit海拔 + 2bit坡度 + 2bit区域")
     print("=" * 60)
     print()
 

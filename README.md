@@ -1,11 +1,11 @@
 # GeoBaker
 
-将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR5/QTR6 格式），用于游戏、仿真和离线地理查询。
+将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR6 格式（兼容旧 QTR5）），用于游戏、仿真和离线地理查询。
 
 ## 特性
 
 - **多源数据融合**：DEM (30m) + 人口 (1km) + 地表类型 (100m)，默认使用公开数据源，无需项目私有凭据。
-- **自适应四叉树 (QTR5/QTR6)**：16bit 节点、非线性海拔编码、动态节点预算。
+- **自适应四叉树 (QTR6，兼容旧 QTR5)**：16bit 节点、非线性海拔编码、动态节点预算。
 - **紧凑二进制格式**：支持 zstd 压缩的 GeoPack，360 x 180 网格索引，适合随机访问。
 - **水陆一致性处理**：NO_DATA 瓦片可结合 ESA WorldCover 判断水陆，避免盲写水瓦片。
 - **沿海城市修正**：用人口栅格辅助修正海岸线附近的水陆误判。
@@ -145,7 +145,7 @@ GeoBaker/
 ├── geo_baker_pkg/               # 核心包
 │   ├── core.py                  # 常量、编码、四叉树
 │   ├── pipeline.py              # 数据下载、对齐、修正和烘焙编排
-│   ├── io.py                    # QTR5/GeoPack 打包和查询
+│   ├── io.py                    # QTR6/GeoPack 打包和查询
 │   └── cli.py                   # 命令行入口
 ├── tools/                       # 查询、验证、可视化工具
 │   ├── geo_inspect.py
@@ -159,7 +159,7 @@ GeoBaker/
 
 ## 架构
 
-### QTR5/QTR6 格式（16bit 节点）
+### QTR6 格式（兼容旧 QTR5）（16bit 节点）
 
 ```text
 地形叶节点: [1bit is_leaf=1][11bit 海拔(非线性)][2bit 坡度][2bit 区域]
@@ -234,7 +234,7 @@ WorldPop ArcGIS ────────┤──→ 下载 ─→ 对齐 ─→
 | Index | 1,036,800 bytes | 360 x 180 网格的 `(offset, size)` 对 |
 | Data | 可变 | zstd 压缩的瓦片数据块 |
 
-### 瓦片二进制 (QTR5/QTR6)
+### 瓦片二进制 (QTR6 / 旧 QTR5)
 
 - **水域瓦片**：1 字节 (`0xFF`)
 - **旧 QTR5 数据瓦片**：2 x N 字节，16bit 节点数组，DFS 前序
@@ -254,12 +254,12 @@ MIT License，详见 [LICENSE](LICENSE)。
 
 # GeoBaker (English)
 
-GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR5/QTR6 format) for games, simulations, and offline geospatial queries.
+GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR6 format with legacy QTR5 compatibility) for games, simulations, and offline geospatial queries.
 
 ## Features
 
 - **Multi-source data fusion**: DEM (30m), population (1km), and land cover (100m), using public data sources by default.
-- **Adaptive quadtree (QTR5/QTR6)**: 16-bit nodes, nonlinear elevation encoding, and budget-aware splitting.
+- **Adaptive quadtree (QTR6, legacy QTR5 compatible)**: 16-bit nodes, nonlinear elevation encoding, and budget-aware splitting.
 - **Compact binary format**: zstd-compressed GeoPack files with a 360 x 180 tile index.
 - **Water/land consistency**: optional ESA-based handling for NO_DATA tiles instead of blindly writing water.
 - **Coastal city correction**: uses population as supporting evidence for inhabited coastlines.
@@ -399,7 +399,7 @@ GeoBaker/
 ├── geo_baker_pkg/               # Core package
 │   ├── core.py                  # Constants, encoding, quadtree
 │   ├── pipeline.py              # Download, align, fix, and bake orchestration
-│   ├── io.py                    # QTR5/GeoPack packing and querying
+│   ├── io.py                    # QTR6/GeoPack packing and querying
 │   └── cli.py                   # CLI entry point
 ├── tools/                       # Query, validation, and visualization tools
 │   ├── geo_inspect.py
@@ -413,7 +413,7 @@ GeoBaker/
 
 ## Architecture
 
-### QTR5/QTR6 Format (16-bit Nodes)
+### QTR6 Format (16-bit Nodes, Legacy QTR5 Compatible)
 
 ```text
 Terrain leaf:    [1bit is_leaf=1][11bit elevation(non-linear)][2bit gradient][2bit zone]
@@ -491,7 +491,7 @@ population as supporting evidence:
 | Index | 1,036,800 bytes | 360 x 180 grid of `(offset, size)` pairs |
 | Data | Variable | zstd-compressed tile payloads |
 
-### Tile Binary (QTR5/QTR6)
+### Tile Binary (QTR6 / Legacy QTR5)
 
 - **Water tile**: 1 byte (`0xFF`)
 - **Legacy QTR5 data tile**: 2 x N bytes, 16-bit node array in DFS pre-order

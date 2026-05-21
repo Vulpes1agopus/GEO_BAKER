@@ -34,7 +34,9 @@ from geo_baker_pkg.core import (
     ZONE_NAMES,
     ZONE_WATER,
     navigate_qtr5,
+    navigate_qtr6,
     navigate_qtr5_pop,
+    unwrap_terrain_tile,
 )
 from geo_baker_pkg.io import query_elevation, query_population
 
@@ -52,15 +54,30 @@ URBAN8_NORM = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5], URBAN
 URBAN8_LABELS = ["None", "Residential", "Commercial", "Industrial", "Mixed", "Institutional", "Reserved", "Reserved"]
 
 
-def _read_node_payload(path: Path) -> Optional[bytes]:
+def _read_pop_payload(path: Path) -> Optional[bytes]:
     if not path.exists():
         return None
     raw = path.read_bytes()
     if not raw:
         return None
-    if len(raw) <= 1:
-        return raw
-    return raw[16:] if raw[:4] == b"QTR5" else raw
+    if len(raw) >= 16 and raw[:4] in (b"QTR5", b"QTR6"):
+        return raw[16:]
+    return raw
+
+
+def _read_terrain_payload(path: Path) -> Optional[Tuple[bytes, str]]:
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    if not raw:
+        return None
+    payload, codec = unwrap_terrain_tile(raw)
+    return payload, codec
+
+
+def _navigate_terrain_payload(payload: bytes, codec: str, frac_lat: float, frac_lon: float):
+    nav = navigate_qtr6 if codec == "qtr6" else navigate_qtr5
+    return nav(payload, frac_lat, frac_lon)
 
 
 def _make_sample_points(grid_size: int = 5) -> List[Tuple[float, float]]:
@@ -90,14 +107,14 @@ def cmd_verify(args: argparse.Namespace) -> None:
             pop_path = tile_dir / f"{lon}_{lat}.pop"
             if not pop_path.exists() or qf.stat().st_size <= 1:
                 continue
-            terrain_data = _read_node_payload(qf)
-            pop_data = _read_node_payload(pop_path)
-            if terrain_data is None or pop_data is None or len(terrain_data) <= 1 or len(pop_data) <= 1:
+            terrain_loaded = _read_terrain_payload(qf)
+            pop_data = _read_pop_payload(pop_path)
+            if terrain_loaded is None or pop_data is None or len(terrain_loaded[0]) <= 1 or len(pop_data) <= 1:
                 continue
             hits = 0
             max_pop = 0.0
             for frac_lat, frac_lon in sample_points:
-                tn = navigate_qtr5(terrain_data, frac_lat, frac_lon)
+                tn = _navigate_terrain_payload(terrain_loaded[0], terrain_loaded[1], frac_lat, frac_lon)
                 pn = navigate_qtr5_pop(pop_data, frac_lat, frac_lon)
                 if not tn or not tn.get("is_leaf") or not pn or not pn.get("is_leaf"):
                     continue
@@ -122,14 +139,14 @@ def cmd_verify(args: argparse.Namespace) -> None:
             pop_path = tile_dir / f"{lon}_{lat}.pop"
             if not pop_path.exists() or qf.stat().st_size <= 1:
                 continue
-            terrain_data = _read_node_payload(qf)
-            pop_data = _read_node_payload(pop_path)
-            if terrain_data is None or pop_data is None or len(terrain_data) <= 1 or len(pop_data) <= 1:
+            terrain_loaded = _read_terrain_payload(qf)
+            pop_data = _read_pop_payload(pop_path)
+            if terrain_loaded is None or pop_data is None or len(terrain_loaded[0]) <= 1 or len(pop_data) <= 1:
                 continue
             hits = 0
             max_pop = 0.0
             for frac_lat, frac_lon in sample_points:
-                tn = navigate_qtr5(terrain_data, frac_lat, frac_lon)
+                tn = _navigate_terrain_payload(terrain_loaded[0], terrain_loaded[1], frac_lat, frac_lon)
                 pn = navigate_qtr5_pop(pop_data, frac_lat, frac_lon)
                 if not tn or not tn.get("is_leaf") or not pn or not pn.get("is_leaf"):
                     continue
@@ -158,12 +175,12 @@ def cmd_verify(args: argparse.Namespace) -> None:
             pf = tile_dir / f"{lon_int}_{lat_int}.pop"
             if not qf.exists() or not pf.exists() or qf.stat().st_size <= 1:
                 continue
-            terrain_data = _read_node_payload(qf)
-            pop_data = _read_node_payload(pf)
-            if terrain_data is None or pop_data is None or len(terrain_data) <= 1 or len(pop_data) <= 1:
+            terrain_loaded = _read_terrain_payload(qf)
+            pop_data = _read_pop_payload(pf)
+            if terrain_loaded is None or pop_data is None or len(terrain_loaded[0]) <= 1 or len(pop_data) <= 1:
                 continue
             frac_lat, frac_lon = lat - lat_int, lon - lon_int
-            tn = navigate_qtr5(terrain_data, frac_lat, frac_lon)
+            tn = _navigate_terrain_payload(terrain_loaded[0], terrain_loaded[1], frac_lat, frac_lon)
             pn = navigate_qtr5_pop(pop_data, frac_lat, frac_lon)
             if not tn or not tn.get("is_leaf") or not pn or not pn.get("is_leaf"):
                 continue
@@ -213,13 +230,13 @@ def _query_tile(lat: float, lon: float, tile_dir: Path) -> Optional[Dict[str, fl
     frac_lat, frac_lon = lat - lat_int, lon - lon_int
     qf = tile_dir / f"{lon_int}_{lat_int}.qtree"
     pf = tile_dir / f"{lon_int}_{lat_int}.pop"
-    terrain_data = _read_node_payload(qf)
-    pop_data = _read_node_payload(pf)
-    if terrain_data is None or pop_data is None:
+    terrain_loaded = _read_terrain_payload(qf)
+    pop_data = _read_pop_payload(pf)
+    if terrain_loaded is None or pop_data is None:
         return None
-    if len(terrain_data) <= 1:
+    if len(terrain_loaded[0]) <= 1:
         return {"elevation": 0.0, "zone": float(ZONE_WATER), "pop": 0.0, "urban": 0.0}
-    tn = navigate_qtr5(terrain_data, frac_lat, frac_lon)
+    tn = _navigate_terrain_payload(terrain_loaded[0], terrain_loaded[1], frac_lat, frac_lon)
     pn = navigate_qtr5_pop(pop_data, frac_lat, frac_lon) if len(pop_data) > 1 else None
     if not tn or not tn.get("is_leaf"):
         return None

@@ -1,7 +1,7 @@
 """
 Core: constants, encoding, quadtree
 
-QTR5/QTR6 format: 16bit nodes, DFS pre-order, subtree_size navigation
+QTR terrain format: QTR6 is current; legacy QTR5 remains readable
 - Terrain leaf: [1b is_leaf=1][11b elevation][2b gradient][2b zone]
 - Pop leaf:     [1b is_leaf=1][12b pop_density][3b urban_type]
 - Branch:       [1b is_leaf=0][15b subtree_size]

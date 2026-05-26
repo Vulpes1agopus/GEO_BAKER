@@ -7,6 +7,7 @@ from unittest import mock
 import numpy as np
 
 from geo_baker_pkg import pipeline
+from geo_baker_pkg.core import ZONE_FOREST, ZONE_NATURAL, ZONE_WATER
 
 
 class PipelineControlTests(unittest.TestCase):
@@ -42,6 +43,20 @@ class PipelineControlTests(unittest.TestCase):
             rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(stats["ok"], 2)
             self.assertEqual([(r["lon"], r["lat"]) for r in rows], [(2, 2), (3, 3)])
+
+    def test_tile_node_budgets_prioritize_semantic_complexity(self):
+        pop_empty = np.zeros((16, 16), dtype=np.float32)
+        plain = np.full((16, 16), ZONE_NATURAL, dtype=np.uint8)
+        mixed_land = plain.copy()
+        mixed_land[:, 8:] = ZONE_FOREST
+        coast = plain.copy()
+        coast[:, :8] = ZONE_WATER
+        busy_pop = np.full((16, 16), 80.0, dtype=np.float32)
+
+        self.assertEqual(pipeline._tile_node_budgets(plain, pop_empty)[0], 10000)
+        self.assertEqual(pipeline._tile_node_budgets(mixed_land, pop_empty)[0], 14000)
+        self.assertEqual(pipeline._tile_node_budgets(coast, pop_empty)[0], 20000)
+        self.assertEqual(pipeline._tile_node_budgets(coast, busy_pop)[0], 24000)
 
 
 if __name__ == "__main__":

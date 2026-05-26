@@ -53,12 +53,12 @@ MAX_NODES = 30000
 FORCE_DEPTH_TERRAIN = 2
 FORCE_DEPTH_POP = 3
 TARGET_SIZE = 1024
-# Elevation and zone split gates.  Variance catches broad relief; max error catches
-# narrow ridges/cliffs that get averaged away; zone minority protects flat coastlines.
-_TERRAIN_VAR = 1.0
-_TERRAIN_MAX_ABS_ERROR = 4.0
-_WATER_MIX_VAR = 5.0
-_ZONE_MIX_MINORITY = 0.005
+# Terrain split gates.  Elevation split uses robust percentiles so single
+# DEM spikes/interpolation noise do not consume an entire tile budget.
+TERRAIN_ROBUST_ERROR_M = 24.0
+TERRAIN_STD_MIN_M = 6.0
+_WATER_ZONE_MIX_MINORITY = 0.001
+_ZONE_MIX_MINORITY = 0.01
 _COASTAL_POP_PX = 10.0
 _POP_VAR = 16.0
 _POP_HOTSPOT_DELTA = 25.0
@@ -283,12 +283,18 @@ def _quad_split(arrays):
 
 
 def _build_quadtree(arrays, should_split_fn, emit_leaf_fn,
-                    max_depth=9, max_nodes=MAX_NODES, force_depth=3):
+                    max_depth=9, max_nodes=MAX_NODES, force_depth=3, stats=None):
     """Build adaptive quadtree. Always produces valid structure (no holes)."""
     nodes = []
 
+    def _stat(key, amount=1):
+        if stats is not None:
+            stats[key] = int(stats.get(key, 0)) + int(amount)
+
     def _rec(arrs, depth, budget):
         if arrs[0].shape[0] <= 2 or arrs[0].shape[1] <= 2 or budget < 5:
+            if budget < 5:
+                _stat('budget_stop')
             emit_leaf_fn(arrs, nodes)
             return 1
         bp = len(nodes)
@@ -316,6 +322,8 @@ def _build_quadtree(arrays, should_split_fn, emit_leaf_fn,
             if decisions[i] and alloc >= 5:
                 used = _rec(q, depth + 1, alloc)
             else:
+                if decisions[i]:
+                    _stat('budget_stop')
                 emit_leaf_fn(q, nodes)
                 used = 1
             total += used
@@ -327,44 +335,88 @@ def _build_quadtree(arrays, should_split_fn, emit_leaf_fn,
     return b''.join(nodes)
 
 
-def _elevation_needs_split(data, var_threshold=_TERRAIN_VAR):
-    mean = float(data.mean())
-    max_abs_error = max(abs(float(data.min()) - mean), abs(float(data.max()) - mean))
-    return float(data.var()) >= var_threshold or max_abs_error >= _TERRAIN_MAX_ABS_ERROR
+def _terrain_error_threshold(depth):
+    if depth <= 5:
+        return TERRAIN_ROBUST_ERROR_M
+    if depth == 6:
+        return 32.0
+    if depth == 7:
+        return 40.0
+    return 48.0
 
 
-def _zone_needs_split(zone_data):
+def _elevation_needs_split(data, depth=0):
+    a = np.asarray(data, dtype=np.float32)
+    if a.size <= 4:
+        return False
+    std = float(a.std())
+    if std < TERRAIN_STD_MIN_M:
+        return False
+    p02, median, p98 = np.percentile(a, [2.0, 50.0, 98.0])
+    robust_error = max(abs(float(p02) - float(median)), abs(float(p98) - float(median)))
+    return robust_error >= _terrain_error_threshold(depth)
+
+
+def _zone_needs_split(zone_data, water_threshold=_WATER_ZONE_MIX_MINORITY,
+                      land_threshold=_ZONE_MIX_MINORITY):
     counts = np.bincount(zone_data.ravel().astype(int), minlength=4)
     total = int(zone_data.size)
     if total <= 0 or np.count_nonzero(counts) <= 1:
         return False
     minority = total - int(counts.max())
-    return (minority / float(total)) >= _ZONE_MIX_MINORITY
+    threshold = water_threshold if (counts[ZONE_WATER] > 0 and counts[ZONE_WATER] < total) else land_threshold
+    return (minority / float(total)) >= threshold
+
+
+def _init_terrain_split_stats(stats):
+    if stats is not None:
+        for key in ('forced', 'split_zone_water', 'split_zone_land', 'split_elevation',
+                    'leaf', 'budget_stop', 'depth_stop'):
+            stats.setdefault(key, 0)
 
 
 def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
                         max_nodes=MAX_NODES, force_depth=FORCE_DEPTH_TERRAIN,
-                        codec=DEFAULT_TERRAIN_CODEC):
+                        codec=DEFAULT_TERRAIN_CODEC, stats=None):
+    _init_terrain_split_stats(stats)
     # Precompute gradient image once — avoids 4 tmp array allocs per leaf
     grad_img = _precompute_grad_img(dem)
     pop_arr = pop  # may be None
 
+    def _stat(key, amount=1):
+        if stats is not None:
+            stats[key] = int(stats.get(key, 0)) + int(amount)
+
     # arrays layout: [dem, zone, pop_or_None, grad_img]
     # grad_img is always arrs[3]; pop is arrs[2] (may be None via _quad_split)
     def _split(arrs, depth, budget, forced):
-        if budget <= 1: return False
-        if forced: return True
-        if depth >= max_depth: return False
+        if budget <= 1:
+            _stat('budget_stop')
+            return False
+        if forced:
+            _stat('forced')
+            return True
+        if depth >= max_depth:
+            _stat('depth_stop')
+            return False
         d, z = arrs[0], arrs[1]
         wc = int(np.count_nonzero(z == ZONE_WATER))
         if wc == z.size:
             p = arrs[2]
-            return _elevation_needs_split(d) if (p is not None and np.any(p > _COASTAL_POP_PX)) else False
-        if wc > 0:
-            return _zone_needs_split(z) or _elevation_needs_split(d, _WATER_MIX_VAR)
-        if _zone_needs_split(z):
+            if p is not None and np.any(p > _COASTAL_POP_PX) and _elevation_needs_split(d, depth):
+                _stat('split_elevation')
+                return True
+            return False
+        if wc > 0 and _zone_needs_split(z):
+            _stat('split_zone_water')
             return True
-        return _elevation_needs_split(d)
+        if wc == 0 and _zone_needs_split(z):
+            _stat('split_zone_land')
+            return True
+        if _elevation_needs_split(d, depth):
+            _stat('split_elevation')
+            return True
+        return False
 
     def _leaf(arrs, nodes):
         d, z, p, gi = arrs[0], arrs[1], arrs[2], arrs[3]
@@ -375,9 +427,10 @@ def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
         me = 0.0 if zv == ZONE_WATER else float(d.mean())
         encoder = encode_leaf_node_qtr6 if codec == 'qtr6' else encode_leaf_node_16
         nodes.append(encoder(me, zv, _grad_level_from_img(gi)))
+        _stat('leaf')
 
     arrays = [dem, zone, pop_arr, grad_img]
-    return _build_quadtree(arrays, _split, _leaf, max_depth, max_nodes, force_depth)
+    return _build_quadtree(arrays, _split, _leaf, max_depth, max_nodes, force_depth, stats=stats)
 
 
 def build_adaptive_pop_tree(pop, urban, max_depth=9,

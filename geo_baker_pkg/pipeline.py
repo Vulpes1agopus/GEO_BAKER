@@ -37,7 +37,7 @@ from .core import (
 
 logger = logging.getLogger('geo_baker')
 
-DEFAULT_TERRAIN_NODE_CAP = max(5000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_TERRAIN_NODE_CAP", "30000"))))
+DEFAULT_TERRAIN_NODE_CAP = max(5000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_TERRAIN_NODE_CAP", "24000"))))
 DEFAULT_POP_NODE_CAP = max(2000, min(MAX_NODES, int(os.environ.get("GEO_BAKER_POP_NODE_CAP", "16000"))))
 
 
@@ -688,15 +688,14 @@ def _tile_node_budgets(zone, pop):
     water_mixed = counts[ZONE_WATER] > 0 and counts[ZONE_WATER] < z.size
     max_pop = float(np.nanmax(pop)) if pop is not None and pop.size else 0.0
 
-    water_fraction = float(counts[ZONE_WATER]) / max(z.size, 1)
-    if water_mixed:
-        terrain_budget = terrain_cap
-    elif zone_mixed or max_pop > 50:
+    if water_mixed and max_pop > 50:
         terrain_budget = min(terrain_cap, 24000)
-    elif water_fraction > 0.01:
-        terrain_budget = min(terrain_cap, 18000)
+    elif water_mixed:
+        terrain_budget = min(terrain_cap, 20000)
+    elif zone_mixed or max_pop > 50:
+        terrain_budget = min(terrain_cap, 14000)
     else:
-        terrain_budget = min(terrain_cap, 12000)
+        terrain_budget = min(terrain_cap, 10000)
 
     if max_pop > 5000:
         pop_budget = pop_cap
@@ -719,7 +718,10 @@ def _compute_tile(lat, lon, dem, pop, zone, urban):
     qtree_path, pop_path = _tile_paths(lat, lon)
     terrain_budget, pop_budget = _tile_node_budgets(zone, pop)
 
-    terrain = build_adaptive_tree(dem, zone, pop, max_nodes=terrain_budget, codec=DEFAULT_TERRAIN_CODEC)
+    split_stats = {}
+    terrain = build_adaptive_tree(
+        dem, zone, pop, max_nodes=terrain_budget, codec=DEFAULT_TERRAIN_CODEC, stats=split_stats
+    )
     terrain_decode = decode_node_qtr6 if DEFAULT_TERRAIN_CODEC == 'qtr6' else decode_node_16
     if not verify_tile(terrain, terrain_decode):
         logger.error(f"[VERIFY] {lon}_{lat}: terrain tree FAILED verification")
@@ -738,10 +740,18 @@ def _compute_tile(lat, lon, dem, pop, zone, urban):
         if pnc >= pop_budget - 64:
             logger.warning(f"[BUDGET] {lon}_{lat}: pop nodes near budget ({pnc}/{pop_budget})")
 
+    split_detail = (
+        f"split=elev:{split_stats.get('split_elevation', 0)} "
+        f"zone_water:{split_stats.get('split_zone_water', 0)} "
+        f"zone_land:{split_stats.get('split_zone_land', 0)} "
+        f"forced:{split_stats.get('forced', 0)} "
+        f"budget_stop:{split_stats.get('budget_stop', 0)} "
+        f"depth_stop:{split_stats.get('depth_stop', 0)}"
+    )
     return {
         'status': 'ok',
         'nodes': nc,
-        'detail': f"nodes={nc}/{terrain_budget}, pop_nodes={pnc}/{pop_budget}",
+        'detail': f"nodes={nc}/{terrain_budget}, pop_nodes={pnc}/{pop_budget}, {split_detail}",
     }
 
 

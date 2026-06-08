@@ -2,10 +2,35 @@
 
 将 CopDEM 海拔、WorldPop 人口、ESA WorldCover 地表类型烘焙为紧凑的二进制四叉树瓦片（QTR6 格式（兼容旧 QTR5）），用于游戏、仿真和离线地理查询。
 
+## 当前状态（2026-06）
+
+GeoBaker 目前处在 **QTR6 语义优先四叉树调参阶段**。二进制格式已经稳定，当前主要工作是让瓦片在保留水陆边界、湖泊河流、城市人口和主要地形轮廓的同时，避免 DEM 纹理或地表分类噪声把节点预算打满。
+
+最近一轮代表性验证使用 824 个高风险瓦片，结果如下：
+
+| 指标 | 结果 |
+| --- | --- |
+| 总数 | 824 |
+| 成功烘焙 | 701 |
+| 纯海洋跳过 | 39 |
+| NO_DATA 待后续处理 | 84 |
+| error | 0 |
+| terrain 平均节点 | 15,812 |
+| terrain p90 / p95 / max | 23,997 / 23,997 / 23,997 |
+| terrain near-budget | 223 / 701 = 31.8% |
+| population near-budget | 114 / 701 = 16.3% |
+
+这轮验证说明：
+
+- 已解决旧策略里 **非水 terrain zone 纹理无限分裂** 的问题，`split_zone_land` 已从上万级降到个位/几十级。
+- 当前尚未达到全量重烘标准；剩余 near-budget 主要来自高山强 relief 的 `split_elevation`，以及湖岸/海岸复杂边界的 `split_zone_water`。
+- 澳洲代表区已经明显好转（near-budget 约 6.6%），但南美、中东/高加索、五大湖、日韩样本仍需继续调参。
+- 因此当前建议流程仍是：小样本验证 → 代表性列表验证 → 诊断出图 → 通过后再全量重烘。
+
 ## 特性
 
 - **多源数据融合**：DEM (30m) + 人口 (1km) + 地表类型 (100m)，默认使用公开数据源，无需项目私有凭据。
-- **自适应四叉树 (QTR6，兼容旧 QTR5)**：16bit 节点、非线性海拔编码、动态节点预算。
+- **语义优先自适应四叉树 (QTR6，兼容旧 QTR5)**：16bit 节点、非线性海拔编码、动态节点预算，优先保护水陆/湖河/人口语义。
 - **紧凑二进制格式**：支持 zstd 压缩的 GeoPack，360 x 180 网格索引，适合随机访问。
 - **水陆一致性处理**：NO_DATA 瓦片可结合 ESA WorldCover 判断水陆，避免盲写水瓦片。
 - **沿海城市修正**：用人口栅格辅助修正海岸线附近的水陆误判。
@@ -87,6 +112,9 @@ python -m geo_baker_pkg --global --dry-run
 | `--global --split 2/1` | 分布式烘焙：第 1 份，共 2 份 |
 | `--global --bake-ocean` | 不跳过海洋瓦片，下载 DEM 处理 |
 | `--global --no-data-water` | NO_DATA 瓦片直接写水瓦片，跳过 zone 检查 |
+| `--rebake-list path.txt` | 按 `lon,lat` 列表批量重烘 |
+| `--direct-rebake` | `--rebake-list` 的线程直跑模式，适合长任务和后台运行 |
+| `--rebake-manifest out.jsonl` | 输出逐瓦片 JSONL 进度和诊断信息 |
 | `--retry-errors` | 重试失败瓦片 |
 | `--fix-coastal` | 检测并修复沿海问题瓦片 |
 | `--fix-pop-zone` | 自动修复人口/城镇与 zone 冲突瓦片 |
@@ -193,6 +221,16 @@ population filename = tiles/{lon}_{lat}.pop
 
 构建和读取必须保持相同象限顺序。
 
+### 地形四叉树分裂策略
+
+当前地形树的目标不是米级复刻所有 DEM 纹理，而是面向游戏和离线查询保留更稳定的语义边界：
+
+- **强制浅层**：terrain 默认强制到浅层，保证基础空间覆盖稳定。
+- **水陆边界优先**：水体与非水体混合时，极小比例的 minority 也会触发 split，用于保护海岸、湖泊和河流边界。
+- **非水 zone 降噪**：forest / natural / harsh 等非水分类只保留浅层大块语义，深层不再因 ESA 纹理继续分裂。
+- **robust elevation error**：高程 split 使用 `p02 / median / p98` 和标准差，而不是 min/max 尖峰，避免单点 DEM 噪声吃满节点预算。
+- **split reason 诊断**：重烘 detail 会输出 `split=elev:... zone_water:... zone_land:... budget_stop:...`，用于判断预算压力来自高程、水体边界还是分类噪声。
+
 ### 数据管线
 
 ```text
@@ -256,10 +294,35 @@ MIT License，详见 [LICENSE](LICENSE)。
 
 GeoBaker bakes CopDEM elevation, WorldPop population, and ESA WorldCover land cover into compact binary quadtree tiles (QTR6 format with legacy QTR5 compatibility) for games, simulations, and offline geospatial queries.
 
+## Current Status (June 2026)
+
+GeoBaker is currently in the **QTR6 semantic-first quadtree tuning stage**. The binary format is stable; the active work is making tile complexity converge naturally while preserving water/land boundaries, lakes and rivers, population semantics, and major terrain shapes.
+
+The latest representative validation used 824 high-risk tiles:
+
+| Metric | Result |
+| --- | --- |
+| Total | 824 |
+| Successfully baked | 701 |
+| Ocean skipped | 39 |
+| NO_DATA for later handling | 84 |
+| Errors | 0 |
+| Terrain average nodes | 15,812 |
+| Terrain p90 / p95 / max | 23,997 / 23,997 / 23,997 |
+| Terrain near-budget | 223 / 701 = 31.8% |
+| Population near-budget | 114 / 701 = 16.3% |
+
+What this means:
+
+- The old **non-water terrain-zone texture explosion** is fixed; `split_zone_land` dropped from tens of thousands to single/double digits in typical tiles.
+- The project is **not ready for a global rebake yet**. Remaining near-budget pressure mainly comes from high-relief `split_elevation` and complex water-boundary `split_zone_water`.
+- Australia is already much better in the representative set (about 6.6% near-budget), while South America, Middle East/Caucasus, Great Lakes, and Japan/Korea still need tuning.
+- The recommended workflow remains: small smoke rebake → representative-list rebake → diagnostic renders → global rebake only after validation passes.
+
 ## Features
 
 - **Multi-source data fusion**: DEM (30m), population (1km), and land cover (100m), using public data sources by default.
-- **Adaptive quadtree (QTR6, legacy QTR5 compatible)**: 16-bit nodes, nonlinear elevation encoding, and budget-aware splitting.
+- **Semantic-first adaptive quadtree (QTR6, legacy QTR5 compatible)**: 16-bit nodes, nonlinear elevation encoding, budget-aware splitting, and priority for water/land, lakes/rivers, and population semantics.
 - **Compact binary format**: zstd-compressed GeoPack files with a 360 x 180 tile index.
 - **Water/land consistency**: optional ESA-based handling for NO_DATA tiles instead of blindly writing water.
 - **Coastal city correction**: uses population as supporting evidence for inhabited coastlines.
@@ -341,6 +404,9 @@ python -m geo_baker_pkg --global --dry-run
 | `--global --split 2/1` | Distributed bake, part 1 of 2 |
 | `--global --bake-ocean` | Do not skip ocean tiles |
 | `--global --no-data-water` | Write NO_DATA tiles as water directly |
+| `--rebake-list path.txt` | Batch rebake from a `lon,lat` list |
+| `--direct-rebake` | Threaded direct mode for long `--rebake-list` jobs |
+| `--rebake-manifest out.jsonl` | Write per-tile JSONL progress and diagnostics |
 | `--retry-errors` | Retry failed tiles |
 | `--fix-coastal` | Detect and fix coastal problem tiles |
 | `--fix-pop-zone` | Auto-fix population/urban vs terrain-zone conflicts |
@@ -446,6 +512,16 @@ Coordinates inside a tile are normalized to `[0, 1)`. Quadrant order is fixed:
 ```
 
 The builder and reader must use the same quadrant order.
+
+### Terrain Quadtree Split Strategy
+
+The terrain tree is not intended to reproduce every small DEM texture at meter-level fidelity. It is tuned for stable game/offline-query semantics:
+
+- **Forced shallow levels** keep basic spatial coverage stable.
+- **Water/land boundaries first**: very small water/non-water minority ratios can trigger split to preserve coasts, lakes, and rivers.
+- **Non-water zone denoising**: forest / natural / harsh classes are kept as coarse semantic hints and no longer drive deep splits from ESA texture alone.
+- **Robust elevation error**: elevation split uses `p02 / median / p98` plus standard deviation instead of min/max spikes.
+- **Split reason diagnostics**: rebake detail includes `split=elev:... zone_water:... zone_land:... budget_stop:...` so budget pressure can be attributed directly.
 
 ### Data Pipeline
 

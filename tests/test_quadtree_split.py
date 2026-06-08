@@ -75,6 +75,19 @@ class QuadtreeSplitTests(unittest.TestCase):
         self.assertEqual(stats.get("split_elevation", 0), 0)
         self.assertTrue(verify_tile(raw, decode_node_qtr6))
 
+    def test_noisy_land_zone_mix_does_not_force_budget(self):
+        rng = np.random.default_rng(123)
+        dem = np.full((128, 128), 100.0, dtype=np.float32)
+        zone = np.full((128, 128), ZONE_NATURAL, dtype=np.uint8)
+        zone[rng.random((128, 128)) < 0.35] = ZONE_FOREST
+        stats = {}
+
+        raw = build_adaptive_tree(dem, zone, max_nodes=20000, stats=stats)
+
+        self.assertLess(len(raw) // 2, 3000)
+        self.assertLess(stats.get("budget_stop", 0), 100)
+        self.assertTrue(verify_tile(raw, decode_node_qtr6))
+
     def test_high_relief_ridge_splits_but_not_to_cap(self):
         dem = np.zeros((128, 128), dtype=np.float32)
         dem[:, 70:] = 900.0

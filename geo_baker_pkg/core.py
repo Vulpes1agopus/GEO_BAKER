@@ -58,7 +58,7 @@ TARGET_SIZE = 1024
 TERRAIN_ROBUST_ERROR_M = 24.0
 TERRAIN_STD_MIN_M = 6.0
 _WATER_ZONE_MIX_MINORITY = 0.001
-_ZONE_MIX_MINORITY = 0.01
+_ZONE_MIX_MINORITY = 0.10
 _COASTAL_POP_PX = 10.0
 _POP_VAR = 16.0
 _POP_HOTSPOT_DELTA = 25.0
@@ -345,6 +345,14 @@ def _terrain_error_threshold(depth):
     return 48.0
 
 
+def _land_zone_mix_threshold(depth):
+    if depth <= 2:
+        return _ZONE_MIX_MINORITY
+    if depth == 3:
+        return 0.45
+    return 1.0
+
+
 def _elevation_needs_split(data, depth=0):
     a = np.asarray(data, dtype=np.float32)
     if a.size <= 4:
@@ -410,7 +418,7 @@ def build_adaptive_tree(dem, zone, pop=None, max_depth=9,
         if wc > 0 and _zone_needs_split(z):
             _stat('split_zone_water')
             return True
-        if wc == 0 and _zone_needs_split(z):
+        if wc == 0 and _zone_needs_split(z, land_threshold=_land_zone_mix_threshold(depth)):
             _stat('split_zone_land')
             return True
         if _elevation_needs_split(d, depth):
